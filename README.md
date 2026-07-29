@@ -4,6 +4,27 @@
 removes a local factory-recovery package made from a captured WIM. Installation
 separates partition work from boot configuration.
 
+## Interactive one-line launcher
+
+Open Windows PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/yuanliuus/createWindowsFactoryRecovery/main/Invoke-WindowsFactoryRecovery.ps1 | iex
+```
+
+The launcher presents a menu for guided creation, a read-only plan,
+prepare-only, integration-only, image update, complete removal, or help. Guided
+creation runs the plan, asks whether to continue, prepares the recovery
+partition and files, and then integrates the verified package. The launcher
+downloads the current manager to a temporary file, displays its SHA-256 hash,
+requests UAC elevation when needed, and removes the temporary copy afterward.
+All confirmations and safety checks in the full manager remain active.
+
+`irm ... | iex` executes code obtained from the network. Review the
+[bootstrap source](https://github.com/yuanliuus/createWindowsFactoryRecovery/blob/main/Invoke-WindowsFactoryRecovery.ps1)
+before using it, and use a commit-specific raw URL when reproducible,
+version-pinned behavior is required.
+
 ## Important safety rules
 
 - Run from elevated **Windows PowerShell 5.1**.
@@ -11,7 +32,11 @@ separates partition work from boot configuration.
   VHD/VHDX boot, and multi-disk boot layouts are refused.
 - Keep tested Windows installation/recovery USB media available.
 - Suspend BitLocker before a modifying operation.
-- The script never deletes the existing WinRE partition.
+- Existing WinRE is preserved by default. `--create` may remove only the
+  enabled, registered, same-disk Microsoft GPT recovery partition during the
+  guarded right-aligned preparation path, when the old partition is directly
+  adjacent and the user approves both the `y/n` choice and typed destructive
+  confirmation.
 - The script never automatically recreates or enlarges an existing factory
   partition. That operation is intentionally offline/manual.
 - Removal deletes only a `FACTORY_RECOVERY` partition whose version-2 manifest
@@ -32,6 +57,8 @@ executable; renamed system tools cannot reliably resolve their MUI messages.
 | `--image-path` | `-i` | Captured WIM |
 | `--image-index` | `-n` | Lock recovery to one index; default allows all |
 | `--recovery-size-gb` | `-s` | New partition size; default 20 |
+| `--create` | `-c` | Guided plan, prepare, and integrate workflow |
+| `--remove-original-winre` | `-o` | With `--create`, remove verified old WinRE |
 | `--prepare` | `-p` | Create/populate only |
 | `--integrate` | `-g` | BCD and WinRE integration only |
 | `--update` | `-u` | Update existing recovery files only |
@@ -76,6 +103,52 @@ To restrict recovery to one image, specify it explicitly:
 Recovery never parses localized DISM output to validate the selection. The
 build-generated catalog and validator whitelist only indexes that existed in
 the copied WIM.
+
+### Guided creation
+
+```powershell
+.\Manage-WindowsFactoryRecovery.ps1 --create
+```
+
+`--create` first displays the four-stage workflow and asks `y/n`. Only after
+approval does it ask for the captured WIM path, recovery partition size, and,
+for a multi-image WIM, whether to lock one index or offer every image during
+recovery. If an enabled, registered, adjacent original WinRE partition is
+verified, it also asks whether that partition should be replaced by the
+right-aligned layout. It then prints the complete read-only machine/WIM plan before
+using the existing preparation safety checks and high-impact confirmation.
+
+After preparation, it verifies the copied WIM, rediscovers the new recovery
+partition, and continues through the existing checkpointed integration flow.
+It still asks whether to add the separate Boot Manager entry. If preparation
+fails, integration is never attempted. If integration fails, its BCD and WinRE
+rollback remains active while the prepared partition is retained for
+inspection.
+
+If original-WinRE removal is selected, the script requires typing
+`REMOVE-ORIGINAL-WINRE`, stages the old `Winre.wim` and SHA-256 in a layout
+checkpoint, shrinks Windows, disables WinRE, and deletes only the previously
+verified partition. It creates Factory Recovery at the right edge formerly
+occupied by the old partition, then extends Windows into the released space on
+the left. The new partition's right edge and the Windows/Factory boundary are
+verified before files are populated and integration begins.
+
+If right-aligned preparation fails, the script removes any incomplete new
+factory partition, restores Windows to its original size, recreates the original
+WinRE partition at its recorded offset and size, restores `Winre.wim`, and
+re-enables REAgentC. Any disk, GPT type, registration, or adjacency mismatch
+refuses the removal path.
+
+Parameters can also be supplied in advance for unattended parameter entry
+while retaining confirmations:
+
+```powershell
+.\Manage-WindowsFactoryRecovery.ps1 `
+  --image-path 'E:\Windows_Images\factory.wim' `
+  --recovery-size-gb 20 `
+  --remove-original-winre `
+  --create
+```
 
 ### 2. Prepare the partition and files
 
@@ -200,17 +273,14 @@ a later step fails.
 
 ## Existing WinRE partition
 
-The script reports the current WinRE configuration but never removes its
-partition automatically. Retire an old WinRE partition only after:
-
-- normal Windows boot has been tested;
-- `reagentc /info` points to `FACTORY_RECOVERY`;
-- ordinary WinRE has booted successfully;
-- Factory Recovery has booted to its confirmation screen without typing
-  `RESTORE`; and
-- a full disk backup exists.
-
-Partition cleanup is intentionally outside this script.
+The original WinRE partition is preserved unless removal is explicitly selected
+as part of `--create`. Removal is unavailable as an independent operation and
+is refused unless the partition is the enabled REAgentC target, uses the
+Microsoft GPT recovery type, is on the Windows disk, is distinct from Windows
+and EFI, and is directly after Windows. The guarded create path backs it up,
+places Factory Recovery against the same right disk boundary, and grows Windows
+to the left edge of Factory Recovery. The separate `--prepare` and `--integrate`
+workflow always preserves the original partition.
 
 ## Verification
 
