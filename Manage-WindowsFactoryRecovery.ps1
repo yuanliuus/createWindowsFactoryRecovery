@@ -34,6 +34,7 @@ $RecoverySizeSpecified = $false
 $AllowedImageIndexes = @()
 $ImagePath = $null
 $Create = $false
+$RemoveOriginalWinre = $false
 $Prepare = $false
 $Integrate = $false
 $Update = $false
@@ -45,6 +46,9 @@ for ($i = 0; $i -lt $CliArguments.Count; $i++) {
     switch ($option) {
         { $_ -in @('--help', '-h') } { $Help = $true }
         { $_ -in @('--create', '-c') } { $Create = $true }
+        { $_ -in @('--remove-original-winre', '-o') } {
+            $RemoveOriginalWinre = $true
+        }
         { $_ -in @('--prepare', '-p') } { $Prepare = $true }
         { $_ -in @('--integrate', '-g') } { $Integrate = $true }
         { $_ -in @('--update', '-u') } { $Update = $true }
@@ -107,6 +111,7 @@ OPTIONS
   --image-index, -n <number>     Lock recovery to one index; default allows all
   --recovery-size-gb, -s <GB>    New partition size; default 20
   --create, -c                    Guided plan, prepare, and integrate workflow
+  --remove-original-winre, -o     With --create, remove verified old WinRE
   --prepare, -p                   Partition/file preparation only
   --integrate, -g                 BCD/WinRE integration only
   --update, -u                    Existing package file update only
@@ -116,8 +121,9 @@ OPTIONS
   --help, -h                      This help
 
 SAFETY
-  Existing WinRE is never deleted. Online recovery-partition recreation and
-  resizing are refused. Integration asks before adding a Boot Manager entry.
+  Existing WinRE is preserved unless --create explicitly requests removal and
+  every identity/adjacency check passes. Integration asks before adding a Boot
+  Manager entry.
   Normal Windows remains the default boot entry.
   Removal requires typing REMOVE-FACTORY and creates a BCD checkpoint.
 '@ | Write-Host
@@ -128,6 +134,9 @@ $modeCount = @(
     $Create, $Prepare, $Integrate, $Update, $RemoveFactory
 ).Where({ $_ }).Count
 if ($modeCount -gt 1) { throw 'Use only one operation option.' }
+if ($RemoveOriginalWinre -and -not $Create) {
+    throw '--remove-original-winre can only be used with --create.'
+}
 if ($Create -and -not $WhatIfPreference) {
     Write-Host ''
     Write-Host 'FACTORY RECOVERY CREATE WORKFLOW' -ForegroundColor Cyan
@@ -136,7 +145,8 @@ if ($Create -and -not $WhatIfPreference) {
     Write-Host '  3. Prepare and verify the recovery partition and files.'
     Write-Host '  4. Integrate the verified package with WinRE and, optionally, Boot Manager.'
     while ($true) {
-        $answer = (Read-Host 'Continue with this workflow? [y/n]').Trim().ToLowerInvariant()
+        $answer = (Read-Host `
+            'Continue to create the factory recovery ? [y/n]').Trim().ToLowerInvariant()
         if ($answer -in @('y', 'yes')) { break }
         if ($answer -in @('n', 'no')) {
             Write-Host 'Create cancelled; no changes made.'
@@ -741,6 +751,8 @@ $factoryVolumes = @(Get-Volume | Where-Object FileSystemLabel -eq $RecoveryLabel
 if ($factoryVolumes.Count -gt 1) { throw "Multiple $RecoveryLabel volumes exist." }
 $factoryVolume = $factoryVolumes | Select-Object -First 1
 $factoryPart = if ($factoryVolume) { Get-Partition -Volume $factoryVolume } else { $null }
+$originalWinrePart = $null
+$removeOriginalWinreApproved = $false
 
 if ($osDisk.PartitionStyle -ne 'GPT') { throw 'Only GPT/UEFI is supported.' }
 if (-not $osDisk.IsBoot -or -not $osDisk.IsSystem -or
@@ -749,6 +761,35 @@ if (-not $osDisk.IsBoot -or -not $osDisk.IsSystem -or
 }
 if ($factoryPart -and $factoryPart.DiskNumber -ne $osDisk.Number) {
     throw "$RecoveryLabel is not on the Windows disk."
+}
+if ($Create -and $registration.Enabled -and
+    $null -ne $registration.DiskNumber -and
+    $null -ne $registration.PartitionNumber) {
+    $candidate = Get-Partition -DiskNumber $registration.DiskNumber `
+        -PartitionNumber $registration.PartitionNumber `
+        -ErrorAction SilentlyContinue
+    $candidateIsVerified = $candidate -and
+        $candidate.DiskNumber -eq $osDisk.Number -and
+        $candidate.PartitionNumber -ne $osPartition.PartitionNumber -and
+        $candidate.PartitionNumber -ne $systemPart.PartitionNumber -and
+        $candidate.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' -and
+        ($osPartition.Offset + $osPartition.Size) -eq $candidate.Offset
+    if ($candidateIsVerified) {
+        $originalWinrePart = $candidate
+        $removeOriginalWinreApproved = $RemoveOriginalWinre
+        if (-not $WhatIfPreference -and -not $RemoveOriginalWinre) {
+            $removeOriginalWinreApproved = Read-YesNo `
+                "Remove original WinRE partition $($candidate.PartitionNumber) after successful integration?"
+        }
+    } elseif ($RemoveOriginalWinre) {
+        throw ('The registered WinRE partition is not a verified, adjacent GPT ' +
+            'recovery partition on the Windows disk; removal is refused.')
+    } elseif ($candidate) {
+        Write-Warning ('The registered WinRE partition exists but is not a ' +
+            'verified adjacent removal candidate; it will be preserved.')
+    }
+} elseif ($RemoveOriginalWinre) {
+    throw 'No enabled, registered original WinRE partition was found; removal is refused.'
 }
 
 $bitlocker = if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
@@ -781,7 +822,16 @@ if ($RemoveFactory -and $factoryPart) {
 } else {
     Write-Host "  Factory : new $RecoverySizeGB GB partition"
 }
-Write-Host '  Old WinRE is preserved. Boot and partition operations are separated.'
+if ($removeOriginalWinreApproved) {
+    Write-Host ("  Old WinRE: remove disk $($originalWinrePart.DiskNumber), " +
+        "partition $($originalWinrePart.PartitionNumber) only after successful integration")
+    Write-Host '  Reclaim : extend the new factory partition into the adjacent released space'
+} elseif ($originalWinrePart) {
+    Write-Host "  Old WinRE: preserve partition $($originalWinrePart.PartitionNumber)"
+} else {
+    Write-Host '  Old WinRE: no verified adjacent removal candidate'
+}
+Write-Host '  Boot and partition operations use separate verified phases.'
 Write-Host "  Boot menu entry is optional; if added, selection timeout is $BootMenuTimeoutSeconds seconds."
 if ($bitlockerOn) { Write-Warning 'BitLocker is enabled.' }
 
@@ -1132,6 +1182,14 @@ try {
         if (-not (Test-Path (Join-Path $oldWinrePath 'Winre.wim'))) {
             throw 'The previous WinRE image cannot be staged for rollback.'
         }
+        if ($Create -and $removeOriginalWinreApproved) {
+            $previousWinreBackup = Join-Path $checkpoint 'PreviousWinre.wim'
+            Copy-Item -LiteralPath (Join-Path $oldWinrePath 'Winre.wim') `
+                -Destination $previousWinreBackup -Force
+            (Get-FileHash -LiteralPath $previousWinreBackup -Algorithm SHA256).Hash |
+                Set-Content (Join-Path $checkpoint 'PreviousWinre.sha256') `
+                    -Encoding ASCII
+        }
     }
     try {
         if ($registration.Enabled) {
@@ -1186,6 +1244,66 @@ try {
             Write-Warning 'Automatic BCD rollback failed. Keep the checkpoint and do not reboot.'
         }
         throw
+    }
+    if ($Create -and $removeOriginalWinreApproved) {
+        if (-not $oldWinrePart -or
+            $oldWinrePart.DiskNumber -ne $originalWinrePart.DiskNumber -or
+            $oldWinrePart.PartitionNumber -ne
+                $originalWinrePart.PartitionNumber) {
+            throw 'The staged previous WinRE partition no longer matches the approved target.'
+        }
+        $registeredAfter = Get-WinreRegistration
+        if (-not $registeredAfter.Enabled -or
+            $registeredAfter.DiskNumber -ne $factoryPart.DiskNumber -or
+            $registeredAfter.PartitionNumber -ne $factoryPart.PartitionNumber) {
+            throw 'Original WinRE removal refused because WinRE is not verified on the factory partition.'
+        }
+        $currentFactoryPart = Get-Partition `
+            -DiskNumber $factoryPart.DiskNumber `
+            -PartitionNumber $factoryPart.PartitionNumber
+        if (($currentFactoryPart.Offset + $currentFactoryPart.Size) -ne
+            $oldWinrePart.Offset) {
+            throw 'Original WinRE removal refused because its space is not adjacent to Factory Recovery.'
+        }
+        Write-Warning ("This permanently deletes original WinRE partition " +
+            "$($oldWinrePart.PartitionNumber) after the new WinRE integration passed.")
+        if ((Read-Host `
+                'Type REMOVE-ORIGINAL-WINRE to delete and combine it with Factory Recovery') -cne
+            'REMOVE-ORIGINAL-WINRE') {
+            Write-Host 'Original WinRE partition was preserved.'
+        } elseif ($PSCmdlet.ShouldProcess(
+                "disk $($oldWinrePart.DiskNumber), partition $($oldWinrePart.PartitionNumber)",
+                'remove original WinRE and extend Factory Recovery')) {
+            if ($oldWinreAccessAdded) {
+                Remove-TemporaryAccessPath `
+                    -DiskNumber $oldWinrePart.DiskNumber `
+                    -PartitionNumber $oldWinrePart.PartitionNumber `
+                    -Letter $oldWinreLetter
+                $oldWinreAccessAdded = $false
+            }
+            $oldPartitionNumber = $oldWinrePart.PartitionNumber
+            Remove-Partition -DiskNumber $oldWinrePart.DiskNumber `
+                -PartitionNumber $oldPartitionNumber -Confirm:$false
+            if (Get-Partition -DiskNumber $oldWinrePart.DiskNumber `
+                    -PartitionNumber $oldPartitionNumber `
+                    -ErrorAction SilentlyContinue) {
+                throw 'The original WinRE partition still exists after removal.'
+            }
+            $currentFactoryPart = Get-Partition `
+                -DiskNumber $factoryPart.DiskNumber `
+                -PartitionNumber $factoryPart.PartitionNumber
+            $factorySupported = Get-PartitionSupportedSize `
+                -DiskNumber $currentFactoryPart.DiskNumber `
+                -PartitionNumber $currentFactoryPart.PartitionNumber
+            Resize-Partition -DiskNumber $currentFactoryPart.DiskNumber `
+                -PartitionNumber $currentFactoryPart.PartitionNumber `
+                -Size $factorySupported.SizeMax
+            $factoryPart = Get-Partition `
+                -DiskNumber $currentFactoryPart.DiskNumber `
+                -PartitionNumber $currentFactoryPart.PartitionNumber
+            Write-Host ('Original WinRE was removed and its adjacent space was ' +
+                'combined with Factory Recovery.') -ForegroundColor Green
+        }
     }
 } finally {
     if ($oldWinreAccessAdded) {

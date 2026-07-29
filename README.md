@@ -32,7 +32,10 @@ version-pinned behavior is required.
   VHD/VHDX boot, and multi-disk boot layouts are refused.
 - Keep tested Windows installation/recovery USB media available.
 - Suspend BitLocker before a modifying operation.
-- The script never deletes the existing WinRE partition.
+- Existing WinRE is preserved by default. `--create` may remove only the
+  enabled, registered, same-disk Microsoft GPT recovery partition after the new
+  WinRE integration succeeds, when the old partition is directly adjacent and
+  the user approves both the `y/n` choice and typed destructive confirmation.
 - The script never automatically recreates or enlarges an existing factory
   partition. That operation is intentionally offline/manual.
 - Removal deletes only a `FACTORY_RECOVERY` partition whose version-2 manifest
@@ -54,6 +57,7 @@ executable; renamed system tools cannot reliably resolve their MUI messages.
 | `--image-index` | `-n` | Lock recovery to one index; default allows all |
 | `--recovery-size-gb` | `-s` | New partition size; default 20 |
 | `--create` | `-c` | Guided plan, prepare, and integrate workflow |
+| `--remove-original-winre` | `-o` | With `--create`, remove verified old WinRE |
 | `--prepare` | `-p` | Create/populate only |
 | `--integrate` | `-g` | BCD and WinRE integration only |
 | `--update` | `-u` | Update existing recovery files only |
@@ -108,8 +112,10 @@ the copied WIM.
 `--create` first displays the four-stage workflow and asks `y/n`. Only after
 approval does it ask for the captured WIM path, recovery partition size, and,
 for a multi-image WIM, whether to lock one index or offer every image during
-recovery. It then prints the complete read-only machine/WIM plan before using
-the existing preparation safety checks and high-impact confirmation.
+recovery. If an enabled, registered, adjacent original WinRE partition is
+verified, it also asks whether that partition should be removed after successful
+integration. It then prints the complete read-only machine/WIM plan before
+using the existing preparation safety checks and high-impact confirmation.
 
 After preparation, it verifies the copied WIM, rediscovers the new recovery
 partition, and continues through the existing checkpointed integration flow.
@@ -118,6 +124,14 @@ fails, integration is never attempted. If integration fails, its BCD and WinRE
 rollback remains active while the prepared partition is retained for
 inspection.
 
+If original-WinRE removal is selected, the script waits until the new WinRE is
+registered and enabled on Factory Recovery and the BCD/default Windows loader
+checks have passed. It then requires typing `REMOVE-ORIGINAL-WINRE`, copies the
+old `Winre.wim` plus its SHA-256 into the integration checkpoint, deletes only
+the previously verified partition, confirms it is gone, and extends Factory
+Recovery into the adjacent released space. Any disk, GPT type, registration, or
+adjacency mismatch refuses removal.
+
 Parameters can also be supplied in advance for unattended parameter entry
 while retaining confirmations:
 
@@ -125,6 +139,7 @@ while retaining confirmations:
 .\Manage-WindowsFactoryRecovery.ps1 `
   --image-path 'E:\Windows_Images\factory.wim' `
   --recovery-size-gb 20 `
+  --remove-original-winre `
   --create
 ```
 
@@ -251,17 +266,13 @@ a later step fails.
 
 ## Existing WinRE partition
 
-The script reports the current WinRE configuration but never removes its
-partition automatically. Retire an old WinRE partition only after:
-
-- normal Windows boot has been tested;
-- `reagentc /info` points to `FACTORY_RECOVERY`;
-- ordinary WinRE has booted successfully;
-- Factory Recovery has booted to its confirmation screen without typing
-  `RESTORE`; and
-- a full disk backup exists.
-
-Partition cleanup is intentionally outside this script.
+The original WinRE partition is preserved unless removal is explicitly selected
+as part of `--create`. Removal is unavailable as an independent operation and
+is refused unless the partition is the enabled REAgentC target, uses the
+Microsoft GPT recovery type, is on the Windows disk, is distinct from Windows
+and EFI, and is positioned so its released space can be combined with the new
+Factory Recovery partition. The separate `--prepare` and `--integrate` workflow
+always preserves the original partition.
 
 ## Verification
 

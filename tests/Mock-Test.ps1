@@ -24,8 +24,9 @@ if ($parseErrors.Count) {
 
 $source = Get-Content $scriptPath -Raw
 $required = @(
-    '--create', '--prepare', '--integrate', '--update', '--remove',
-    'Continue with this workflow? [y/n]',
+    '--create', '--remove-original-winre',
+    '--prepare', '--integrate', '--update', '--remove',
+    'Continue to create the factory recovery ? [y/n]',
     'Collect the image and recovery-size parameters.',
     'Preparation verified; continuing to integration.',
     'user selects during recovery',
@@ -38,7 +39,11 @@ $required = @(
     'Private device-options object',
     '/create /d ''Factory Recovery Ramdisk'' /device',
     'Checkpoint-', '/export', '/import',
-    'Old WinRE is preserved',
+    'Old WinRE: no verified adjacent removal candidate',
+    'Remove original WinRE partition',
+    'Type REMOVE-ORIGINAL-WINRE',
+    "Remove-Partition -DiskNumber `$oldWinrePart.DiskNumber",
+    'PreviousWinre.sha256',
     'Online delete/recreate resizing is intentionally disabled',
     'Type REMOVE-FACTORY to permanently remove factory recovery',
     'New-CleanWinre',
@@ -65,6 +70,26 @@ if ($exportPosition -lt 0 -or $disablePosition -lt 0 -or
     $exportPosition -gt $disablePosition) {
     throw 'BCD export must occur before WinRE is disabled.'
 }
+$previousWinreBackupPosition = $source.IndexOf(
+    "Join-Path `$checkpoint 'PreviousWinre.wim'")
+$integrationDisablePosition = if ($previousWinreBackupPosition -ge 0) {
+    $source.IndexOf("reagentc.exe @('/disable')",
+        $previousWinreBackupPosition)
+} else { -1 }
+if ($previousWinreBackupPosition -lt 0 -or
+    $integrationDisablePosition -lt 0 -or
+    $previousWinreBackupPosition -gt $integrationDisablePosition) {
+    throw 'Original WinRE must be backed up before WinRE is disabled.'
+}
+$factoryRegistrationCheckPosition = $source.IndexOf(
+    '$registeredAfter = Get-WinreRegistration')
+$originalRemovalPosition = $source.IndexOf(
+    'Remove-Partition -DiskNumber $oldWinrePart.DiskNumber')
+if ($factoryRegistrationCheckPosition -lt 0 -or
+    $originalRemovalPosition -lt 0 -or
+    $factoryRegistrationCheckPosition -gt $originalRemovalPosition) {
+    throw 'Factory WinRE registration must be verified before original partition removal.'
+}
 
 $source = $source -replace
     '(?s)# MOCK-ADMIN-CHECK-BEGIN.*?# MOCK-ADMIN-CHECK-END',
@@ -73,6 +98,7 @@ $production = [scriptblock]::Create($source)
 $script:Mutations = 0
 $script:MockMultipleImages = $false
 $script:CancelCreate = $false
+$script:MockOriginalWinre = $false
 
 function Stop-Mutation([string] $Name) {
     $script:Mutations++
@@ -98,7 +124,7 @@ function global:dism.exe {
 function global:Read-Host {
     param([string] $Prompt)
     if ($script:CancelCreate -and
-        $Prompt -eq 'Continue with this workflow? [y/n]') {
+        $Prompt -eq 'Continue to create the factory recovery ? [y/n]') {
         return 'n'
     }
     throw "Unexpected mock prompt: $Prompt"
@@ -106,7 +132,12 @@ function global:Read-Host {
 function global:reagentc.exe {
     if ($args -contains '/info') {
         $global:LASTEXITCODE = 0
-        'Windows RE status: Disabled'
+        if ($script:MockOriginalWinre) {
+            'Windows RE status: Enabled'
+            'Windows RE location: \\?\GLOBALROOT\device\harddisk0\partition4\Recovery\WindowsRE'
+        } else {
+            'Windows RE status: Disabled'
+        }
         return
     }
     Stop-Mutation 'reagentc'
@@ -126,23 +157,43 @@ function global:Get-Disk {
     }
 }
 function global:Get-Partition {
-    param([string] $DriveLetter, [int] $DiskNumber, [object] $Volume)
+    param(
+        [string] $DriveLetter,
+        [int] $DiskNumber,
+        [int] $PartitionNumber,
+        [object] $Volume
+    )
     if ($DriveLetter) {
         return [pscustomobject]@{
             DiskNumber = 0; PartitionNumber = 3; Size = 100GB; Offset = 1GB
         }
     }
     if ($Volume) { return $null }
-    @(
+    $partitions = @(
         [pscustomobject]@{
             DiskNumber = 0; PartitionNumber = 1
             GptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+            Offset = 1MB; Size = 100MB
         },
         [pscustomobject]@{
             DiskNumber = 0; PartitionNumber = 3
             GptType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+            Offset = 1GB; Size = 100GB
         }
     )
+    if ($script:MockOriginalWinre) {
+        $partitions += [pscustomobject]@{
+            DiskNumber = 0; PartitionNumber = 4
+            GptType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
+            Offset = 101GB; Size = 1GB
+        }
+    }
+    if ($PSBoundParameters.ContainsKey('PartitionNumber')) {
+        return $partitions |
+            Where-Object PartitionNumber -eq $PartitionNumber |
+            Select-Object -First 1
+    }
+    $partitions
 }
 function global:Get-Volume {
     param([object] $Partition, [string] $DriveLetter)
@@ -194,6 +245,17 @@ try {
     }
     $script:MockMultipleImages = $false
 
+    $script:MockOriginalWinre = $true
+    $removeOriginalPlan = & $production '-i' $tempImage '--create' `
+        '--remove-original-winre' '--what-if' 6>&1 | Out-String
+    $script:MockOriginalWinre = $false
+    if ($removeOriginalPlan -notmatch
+        'Old WinRE:\s+remove disk 0, partition 4 only after successful integration' -or
+        $removeOriginalPlan -notmatch
+        'Reclaim\s+:\s+extend the new factory partition') {
+        throw "Original WinRE removal plan test failed.`n$removeOriginalPlan"
+    }
+
     foreach ($arguments in @(
         @('-i', $tempImage, '--create', '--what-if'),
         @('-i', $tempImage, '--prepare', '--what-if'),
@@ -218,6 +280,7 @@ try {
         LockedImageSelection = 'PASS'
         CreateCancellation = 'PASS'
         CreateWhatIf = 'PASS'
+        OriginalWinreRemovalPlan = 'PASS'
         PrepareWhatIf = 'PASS'
         UpdateWhatIf = 'PASS'
         IntegrateWhatIf = 'PASS'
