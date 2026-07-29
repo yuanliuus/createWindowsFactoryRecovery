@@ -9,7 +9,7 @@ The workflow is deliberately split into independent operations:
   --create    Plans, prepares, and integrates in one guided workflow.
   --prepare   Creates/populates the recovery partition; never changes boot data.
   --integrate Registers WinRE and adds a boot entry; never changes partitions.
-  --update    Replaces recovery files with side-by-side verified copies.
+  --update    Rebuilds recovery files and replaces them in place.
   --remove    Removes a verified package, its integration, and its partition.
 
 With no operation option, the script prints a read-only plan.
@@ -700,6 +700,13 @@ function Assert-Package {
         throw ("Package disk ID mismatch. Manifest: '$($data.DiskId)'; " +
             "current: '$diskId'.")
     }
+    if ($data.Status -eq 'UpdateInProgress') {
+        if (-not $AllowLegacyPartitionNumberDrift) {
+            throw ('A previous in-place update did not finish. Run --update ' +
+                'again with the captured WIM before integration or removal.')
+        }
+        Write-Warning 'Resuming a previously interrupted in-place update.'
+    }
     if ($Part.DiskNumber -ne $osDisk.Number -or
         $Part.GptType -ne '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') {
         throw 'The labeled Factory Recovery volume is not a recovery partition on the Windows disk.'
@@ -1194,17 +1201,8 @@ try {
             }
             Write-Host 'Cancelled; no changes made.'; return
         }
-        $volume = Get-Volume -DriveLetter $activeLetter
-        $newImage = "$($paths.Image).new"
-        $existingStageCandidate = (Test-Path -LiteralPath $newImage -PathType Leaf) -and
-            (Get-Item -LiteralPath $newImage).Length -eq $image.Length
-        $additionalSpaceRequired = if ($existingStageCandidate) { 1GB } else {
-            $image.Length + 1GB
-        }
-        if ($volume.SizeRemaining -lt $additionalSpaceRequired) {
-            throw 'Insufficient free space for verified side-by-side staging.'
-        }
-        if ((Read-Host 'Type UPDATE to replace the recovery files') -cne 'UPDATE') {
+        if ((Read-Host 'Type UPDATE to replace the recovery files in place') -cne
+            'UPDATE') {
             Write-Host 'Cancelled; no changes made.'; return
         }
         $base = if ((Test-Path -LiteralPath $paths.WinRE -PathType Leaf) -and
@@ -1220,37 +1218,42 @@ try {
             $systemPart.PartitionNumber $diskId `
             $AllowedImageIndexes $wimImages
         $hash = (Get-FileHash $resolvedImage -Algorithm SHA256).Hash
-        $stagedHash = if ($existingStageCandidate) {
-            (Get-FileHash $newImage -Algorithm SHA256).Hash
-        } else { $null }
-        if ($stagedHash -ne $hash) {
-            Copy-Item $resolvedImage $newImage -Force
-            $stagedHash = (Get-FileHash $newImage -Algorithm SHA256).Hash
-        }
-        if ($stagedHash -ne $hash) {
-            throw 'Staged WIM hash mismatch; current files are untouched.'
-        }
-        foreach ($item in @(
-            @($paths.Image, $newImage),
-            @($paths.FactoryRE, $custom.FactoryRE),
-            @($paths.WinRE, $custom.WinRE))) {
-            $replacement = if ($item[1] -like "$WorkingRoot*") {
-                "$($item[0]).new"
-            } else { $item[1] }
-            if ($replacement -ne $item[1]) { Copy-Item $item[1] $replacement -Force }
-            $backup = "$($item[0]).bak"
-            Move-Item $item[0] $backup -Force
-            try { Move-Item $replacement $item[0] -Force }
-            catch { Move-Item $backup $item[0] -Force; throw }
-            Remove-Item $backup -Force
-        }
         $existingBcd = if ($manifest.LoaderGuid -and $manifest.RamdiskGuid) {
             [pscustomobject]@{
                 LoaderGuid = $manifest.LoaderGuid
                 RamdiskGuid = $manifest.RamdiskGuid
             }
         } else { $null }
-        Write-Manifest $paths $factoryPart $manifest.Status $hash $existingBcd
+        $finalStatus = if ($existingBcd) { 'Integrated' } else { 'Prepared' }
+        $previousHash = if ($manifest.PSObject.Properties.Name -contains
+                'ImageSha256' -and $manifest.ImageSha256) {
+            $manifest.ImageSha256
+        } else {
+            (Get-FileHash -LiteralPath $paths.Image -Algorithm SHA256).Hash
+        }
+        Write-Manifest $paths $factoryPart 'UpdateInProgress' `
+            $previousHash $existingBcd
+        Write-Warning ('Replacing files in place. Do not restart or power off ' +
+            'until the update reports success.')
+        Copy-Item -LiteralPath $resolvedImage -Destination $paths.Image -Force
+        if ((Get-FileHash -LiteralPath $paths.Image -Algorithm SHA256).Hash -ne
+            $hash) {
+            throw ('Factory WIM hash mismatch after in-place replacement. ' +
+                'The manifest is marked UpdateInProgress; rerun --update.')
+        }
+        foreach ($item in @(
+                @($custom.FactoryRE, $paths.FactoryRE),
+                @($custom.WinRE, $paths.WinRE))) {
+            $sourceHash = (Get-FileHash -LiteralPath $item[0] `
+                -Algorithm SHA256).Hash
+            Copy-Item -LiteralPath $item[0] -Destination $item[1] -Force
+            if ((Get-FileHash -LiteralPath $item[1] -Algorithm SHA256).Hash -ne
+                $sourceHash) {
+                throw ("Recovery image hash mismatch after replacing $($item[1]). " +
+                    'The manifest is marked UpdateInProgress; rerun --update.')
+            }
+        }
+        Write-Manifest $paths $factoryPart $finalStatus $hash $existingBcd
         Write-Host 'Recovery files updated; BCD and WinRE were not changed.' -ForegroundColor Green
         return
     }
