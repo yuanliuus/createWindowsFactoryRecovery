@@ -111,7 +111,7 @@ OPTIONS
   --image-index, -n <number>     Lock recovery to one index; default allows all
   --recovery-size-gb, -s <GB>    New partition size; default 20
   --create, -c                    Guided plan, prepare, and integrate workflow
-  --remove-original-winre, -o     With --create, remove verified old WinRE
+  --remove-original-winre, -o     Disabled: original WinRE is always preserved
   --prepare, -p                   Partition/file preparation only
   --integrate, -g                 BCD/WinRE integration only
   --update, -u                    Existing package file update only
@@ -121,9 +121,9 @@ OPTIONS
   --help, -h                      This help
 
 SAFETY
-  Existing WinRE is preserved unless --create explicitly requests removal and
-  every identity/adjacency check passes. Integration asks before adding a Boot
-  Manager entry.
+  Existing WinRE is always preserved. Live deletion/recreation of the original
+  WinRE partition is disabled after a boot-disk incident. Integration asks
+  before adding a Boot Manager entry.
   Normal Windows remains the default boot entry.
   Removal requires typing REMOVE-FACTORY and creates a BCD checkpoint.
 '@ | Write-Host
@@ -134,8 +134,10 @@ $modeCount = @(
     $Create, $Prepare, $Integrate, $Update, $RemoveFactory
 ).Where({ $_ }).Count
 if ($modeCount -gt 1) { throw 'Use only one operation option.' }
-if ($RemoveOriginalWinre -and -not $Create) {
-    throw '--remove-original-winre can only be used with --create.'
+if ($RemoveOriginalWinre) {
+    throw ('--remove-original-winre is disabled. Live replacement of the ' +
+        'original WinRE partition is not safe; create Factory Recovery while ' +
+        'preserving the original partition.')
 }
 if ($Create -and -not $WhatIfPreference) {
     Write-Host ''
@@ -309,6 +311,48 @@ remove letter=$Letter
 exit
 "@ | Set-Content -LiteralPath $cleanupFile -Encoding ASCII
         Invoke-Native diskpart.exe @('/s', $cleanupFile) | Out-Host
+    }
+}
+
+function Get-VerifiedPartitionAtOffset {
+    param(
+        [int] $DiskNumber,
+        [uint64] $Offset,
+        [uint64] $Size,
+        [string] $Purpose
+    )
+
+    $matches = @(Get-Partition -DiskNumber $DiskNumber |
+        Where-Object {
+            [uint64]$_.Offset -eq $Offset -and [uint64]$_.Size -eq $Size
+        })
+    if ($matches.Count -ne 1) {
+        throw "$Purpose identity check failed at offset $Offset, size $Size."
+    }
+    $matches[0]
+}
+
+function Assert-BootLayoutUnchanged {
+    param(
+        [object] $ExpectedOs,
+        [object] $ExpectedSystem
+    )
+
+    $currentDisk = Get-Disk -Number $ExpectedOs.DiskNumber
+    if ($currentDisk.IsOffline -or $currentDisk.IsReadOnly -or
+        -not $currentDisk.IsBoot -or -not $currentDisk.IsSystem) {
+        throw 'Boot disk became offline, read-only, or lost boot/system identity.'
+    }
+    $currentOs = Get-VerifiedPartitionAtOffset -DiskNumber $ExpectedOs.DiskNumber `
+        -Offset ([uint64]$ExpectedOs.Offset) -Size ([uint64]$ExpectedOs.Size) `
+        -Purpose 'Windows partition'
+    $currentSystem = Get-VerifiedPartitionAtOffset `
+        -DiskNumber $ExpectedSystem.DiskNumber `
+        -Offset ([uint64]$ExpectedSystem.Offset) -Size ([uint64]$ExpectedSystem.Size) `
+        -Purpose 'EFI system partition'
+    if ($currentOs.GptType -ne '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' -or
+        $currentSystem.GptType -ne '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}') {
+        throw 'Windows or EFI partition type changed unexpectedly.'
     }
 }
 
@@ -600,14 +644,30 @@ function New-CleanWinre {
 function Write-Manifest {
     param([object] $Paths, [object] $Part, [string] $Status,
         [string] $Hash, [object] $Bcd)
+    $manifestOs = Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')
+    $manifestSystem = Get-VerifiedPartitionAtOffset `
+        -DiskNumber $systemPart.DiskNumber `
+        -Offset ([uint64]$systemPart.Offset) -Size ([uint64]$systemPart.Size) `
+        -Purpose 'EFI system partition for manifest'
+    $manifestRecovery = Get-VerifiedPartitionAtOffset `
+        -DiskNumber $Part.DiskNumber `
+        -Offset ([uint64]$Part.Offset) -Size ([uint64]$Part.Size) `
+        -Purpose 'Factory Recovery partition for manifest'
     [ordered]@{
-        SchemaVersion = 3
+        SchemaVersion = 4
         Status = $Status
         PreparedUtc = [DateTime]::UtcNow.ToString('o')
         DiskId = $diskId
         DiskNumber = $osDisk.Number
-        OsPartitionNumber = $osPartition.PartitionNumber
-        RecoveryPartitionNumber = $Part.PartitionNumber
+        OsPartitionNumber = $manifestOs.PartitionNumber
+        OsPartitionOffset = [uint64]$manifestOs.Offset
+        OsPartitionSize = [uint64]$manifestOs.Size
+        RecoveryPartitionNumber = $manifestRecovery.PartitionNumber
+        RecoveryPartitionOffset = [uint64]$manifestRecovery.Offset
+        RecoveryPartitionSize = [uint64]$manifestRecovery.Size
+        SystemPartitionNumber = $manifestSystem.PartitionNumber
+        SystemPartitionOffset = [uint64]$manifestSystem.Offset
+        SystemPartitionSize = [uint64]$manifestSystem.Size
         ImageIndex = if ($AllowedImageIndexes.Count -eq 1) {
             $AllowedImageIndexes[0]
         } else { $null }
@@ -622,19 +682,75 @@ function Write-Manifest {
 }
 
 function Assert-Package {
-    param([object] $Paths, [object] $Part)
+    param(
+        [object] $Paths,
+        [object] $Part,
+        [switch] $AllowLegacyPartitionNumberDrift
+    )
     foreach ($file in @($Paths.Image, $Paths.FactoryRE, $Paths.WinRE, $Paths.Manifest)) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
             throw "Incomplete package; missing $file."
         }
     }
     $data = Get-Content $Paths.Manifest -Raw | ConvertFrom-Json
-    if ($data.SchemaVersion -notin @(2, 3) -or $data.DiskId -ne $diskId -or
-        $data.OsPartitionNumber -ne $osPartition.PartitionNumber -or
-        $data.RecoveryPartitionNumber -ne $Part.PartitionNumber) {
-        throw 'Package manifest does not match this disk layout.'
+    if ($data.SchemaVersion -notin @(2, 3, 4)) {
+        throw "Unsupported package manifest schema '$($data.SchemaVersion)'."
     }
-    if ($data.SchemaVersion -eq 3 -and
+    if ($data.DiskId -ne $diskId) {
+        throw ("Package disk ID mismatch. Manifest: '$($data.DiskId)'; " +
+            "current: '$diskId'.")
+    }
+    if ($Part.DiskNumber -ne $osDisk.Number -or
+        $Part.GptType -ne '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') {
+        throw 'The labeled Factory Recovery volume is not a recovery partition on the Windows disk.'
+    }
+    $currentOs = Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')
+    if ($data.SchemaVersion -eq 4) {
+        $layoutMismatches = [Collections.Generic.List[string]]::new()
+        foreach ($comparison in @(
+                @('Windows offset', [uint64]$data.OsPartitionOffset,
+                    [uint64]$currentOs.Offset),
+                @('Windows size', [uint64]$data.OsPartitionSize,
+                    [uint64]$currentOs.Size),
+                @('Factory offset', [uint64]$data.RecoveryPartitionOffset,
+                    [uint64]$Part.Offset),
+                @('Factory size', [uint64]$data.RecoveryPartitionSize,
+                    [uint64]$Part.Size),
+                @('EFI offset', [uint64]$data.SystemPartitionOffset,
+                    [uint64]$systemPart.Offset),
+                @('EFI size', [uint64]$data.SystemPartitionSize,
+                    [uint64]$systemPart.Size))) {
+            if ($comparison[1] -ne $comparison[2]) {
+                $layoutMismatches.Add(
+                    "$($comparison[0]): manifest $($comparison[1]), current $($comparison[2])")
+            }
+        }
+        if ($layoutMismatches.Count) {
+            throw ("Package immutable-layout mismatch: " +
+                ($layoutMismatches -join '; '))
+        }
+    } else {
+        $numberMismatches = [Collections.Generic.List[string]]::new()
+        if ($data.OsPartitionNumber -ne $currentOs.PartitionNumber) {
+            $numberMismatches.Add(
+                "Windows: manifest $($data.OsPartitionNumber), current $($currentOs.PartitionNumber)")
+        }
+        if ($data.RecoveryPartitionNumber -ne $Part.PartitionNumber) {
+            $numberMismatches.Add(
+                "Factory: manifest $($data.RecoveryPartitionNumber), current $($Part.PartitionNumber)")
+        }
+        if ($numberMismatches.Count) {
+            $detail = $numberMismatches -join '; '
+            if (-not $AllowLegacyPartitionNumberDrift) {
+                throw ("Legacy package partition-number mismatch: $detail. " +
+                    'Run --update with the captured WIM to rebuild the embedded ' +
+                    'restore layout before integration.')
+            }
+            Write-Warning ("Legacy partition numbers changed ($detail). Update " +
+                'will rebuild both recovery images and write an immutable schema-4 manifest.')
+        }
+    }
+    if ($data.SchemaVersion -in @(3, 4) -and
         @($data.AllowedImageIndexes).Count -eq 0) {
         throw 'Package manifest has no allowed factory image indexes.'
     }
@@ -752,7 +868,6 @@ if ($factoryVolumes.Count -gt 1) { throw "Multiple $RecoveryLabel volumes exist.
 $factoryVolume = $factoryVolumes | Select-Object -First 1
 $factoryPart = if ($factoryVolume) { Get-Partition -Volume $factoryVolume } else { $null }
 $originalWinrePart = $null
-$removeOriginalWinreApproved = $false
 
 if ($osDisk.PartitionStyle -ne 'GPT') { throw 'Only GPT/UEFI is supported.' }
 if (-not $osDisk.IsBoot -or -not $osDisk.IsSystem -or
@@ -776,20 +891,12 @@ if ($Create -and $registration.Enabled -and
         ($osPartition.Offset + $osPartition.Size) -eq $candidate.Offset
     if ($candidateIsVerified) {
         $originalWinrePart = $candidate
-        $removeOriginalWinreApproved = $RemoveOriginalWinre
-        if (-not $WhatIfPreference -and -not $RemoveOriginalWinre) {
-            $removeOriginalWinreApproved = Read-YesNo `
-                "Remove original WinRE partition $($candidate.PartitionNumber) and reclaim its space for Windows?"
-        }
-    } elseif ($RemoveOriginalWinre) {
-        throw ('The registered WinRE partition is not a verified, adjacent GPT ' +
-            'recovery partition on the Windows disk; removal is refused.')
+        Write-Verbose ("Original WinRE partition $($candidate.PartitionNumber) " +
+            'was verified and will be preserved.')
     } elseif ($candidate) {
         Write-Warning ('The registered WinRE partition exists but is not a ' +
-            'verified adjacent removal candidate; it will be preserved.')
+            'verified adjacent partition; it will still be preserved.')
     }
-} elseif ($RemoveOriginalWinre) {
-    throw 'No enabled, registered original WinRE partition was found; removal is refused.'
 }
 
 $bitlocker = if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
@@ -822,15 +929,10 @@ if ($RemoveFactory -and $factoryPart) {
 } else {
     Write-Host "  Factory : new $RecoverySizeGB GB partition"
 }
-if ($removeOriginalWinreApproved) {
-    Write-Host ("  Old WinRE: remove disk $($originalWinrePart.DiskNumber), " +
-        "partition $($originalWinrePart.PartitionNumber) during preparation")
-    Write-Host '  Layout  : right-align Factory Recovery at the old disk end'
-    Write-Host '  Reclaim : extend Windows into the released space left of Factory Recovery'
-} elseif ($originalWinrePart) {
+if ($originalWinrePart) {
     Write-Host "  Old WinRE: preserve partition $($originalWinrePart.PartitionNumber)"
 } else {
-    Write-Host '  Old WinRE: no verified adjacent removal candidate'
+    Write-Host '  Old WinRE: preserve any existing recovery partition'
 }
 Write-Host '  Boot and partition operations use separate verified phases.'
 Write-Host "  Boot menu entry is optional; if added, selection timeout is $BootMenuTimeoutSeconds seconds."
@@ -864,84 +966,33 @@ if ($Prepare -or $Create) {
         Write-Host 'Cancelled; no changes made.'
         return
     }
-    if ($Create -and $removeOriginalWinreApproved -and
-        (Read-Host `
-            'Type REMOVE-ORIGINAL-WINRE to approve right-aligned replacement') -cne
-        'REMOVE-ORIGINAL-WINRE') {
-        Write-Host 'Original WinRE removal cancelled; it will be preserved.'
-        $removeOriginalWinreApproved = $false
-    }
     if (-not $PSCmdlet.ShouldProcess("disk $($osDisk.Number)", 'prepare recovery partition')) {
         return
     }
     $base = Get-BaseWinre $registration
     $newPart = $null
-    $originalOsSize = $osPartition.Size
-    $originalWinreRemoved = $false
-    $winreDisabledForLayout = $false
-    $layoutCheckpoint = $null
-    if ($Create -and $removeOriginalWinreApproved) {
-        $layoutCheckpoint = Join-Path $WorkingRoot `
-            ('OriginalWinRE-Layout-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-        New-Item -ItemType Directory -Path $layoutCheckpoint -Force | Out-Null
-        Copy-Item -LiteralPath $base `
-            -Destination (Join-Path $layoutCheckpoint 'PreviousWinre.wim') -Force
-        (Get-FileHash `
-            -LiteralPath (Join-Path $layoutCheckpoint 'PreviousWinre.wim') `
-            -Algorithm SHA256).Hash |
-            Set-Content (Join-Path $layoutCheckpoint 'PreviousWinre.sha256') `
-                -Encoding ASCII
-        $registration.Raw |
-            Set-Content (Join-Path $layoutCheckpoint 'ReAgent-before.txt')
-        Invoke-Native bcdedit.exe @('/export',
-            (Join-Path $layoutCheckpoint 'BCD'))
-    }
     try {
         Resize-Partition -DiskNumber $osDisk.Number `
             -PartitionNumber $osPartition.PartitionNumber `
             -Size ($osPartition.Size - $RecoveryBytes -
                 $PartitionAlignmentReserve)
-        if ($Create -and $removeOriginalWinreApproved) {
-            Invoke-Native reagentc.exe @('/disable')
-            $winreDisabledForLayout = $true
-            $rightAlignedOffset = (
-                $originalWinrePart.Offset + $originalWinrePart.Size
-            ) - $RecoveryBytes
-            $shrunkOs = Get-Partition -DiskNumber $osDisk.Number `
-                -PartitionNumber $osPartition.PartitionNumber
-            if ($rightAlignedOffset -le
-                ($shrunkOs.Offset + $shrunkOs.Size)) {
-                throw 'Right-aligned Factory Recovery would overlap Windows.'
-            }
-            Remove-Partition -DiskNumber $originalWinrePart.DiskNumber `
-                -PartitionNumber $originalWinrePart.PartitionNumber `
-                -Confirm:$false
-            $originalWinreRemoved = $true
-            $newPart = New-Partition -DiskNumber $osDisk.Number `
-                -Offset $rightAlignedOffset -Size $RecoveryBytes `
-                -DriveLetter $RecoveryLetter
-            $shrunkOs = Get-Partition -DiskNumber $osDisk.Number `
-                -PartitionNumber $osPartition.PartitionNumber
-            $expandedOsSupported = Get-PartitionSupportedSize `
-                -DiskNumber $shrunkOs.DiskNumber `
-                -PartitionNumber $shrunkOs.PartitionNumber
-            Resize-Partition -DiskNumber $shrunkOs.DiskNumber `
-                -PartitionNumber $shrunkOs.PartitionNumber `
-                -Size $expandedOsSupported.SizeMax
-            $expandedOs = Get-Partition -DiskNumber $osDisk.Number `
-                -PartitionNumber $osPartition.PartitionNumber
-            if (($newPart.Offset + $newPart.Size) -ne
-                    ($originalWinrePart.Offset + $originalWinrePart.Size) -or
-                ($expandedOs.Offset + $expandedOs.Size) -ne $newPart.Offset) {
-                throw 'The right-aligned Windows/Factory Recovery layout failed verification.'
-            }
-            $registration = Get-WinreRegistration
-        } else {
-            $newPart = New-Partition -DiskNumber $osDisk.Number `
-                -Size $RecoveryBytes -DriveLetter $RecoveryLetter
+        $shrunkOs = Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')
+        Assert-BootLayoutUnchanged -ExpectedOs $shrunkOs -ExpectedSystem $systemPart
+        $newPart = New-Partition -DiskNumber $osDisk.Number `
+            -Size $RecoveryBytes `
+            -GptType '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
+        $newPart = Get-VerifiedPartitionAtOffset -DiskNumber $osDisk.Number `
+            -Offset ([uint64]$newPart.Offset) -Size ([uint64]$newPart.Size) `
+            -Purpose 'new Factory Recovery partition'
+        if ($newPart.Offset -lt ($shrunkOs.Offset + $shrunkOs.Size) -or
+            $newPart.Offset -eq $systemPart.Offset) {
+            throw 'New Factory Recovery partition overlaps a protected partition.'
         }
+        Assert-BootLayoutUnchanged -ExpectedOs $shrunkOs -ExpectedSystem $systemPart
         $newPart | Format-Volume -FileSystem NTFS `
             -NewFileSystemLabel $RecoveryLabel -Confirm:$false | Out-Null
+        Add-PartitionAccessPath -InputObject $newPart `
+            -AccessPath "$RecoveryLetter`:\"
         $custom = New-CustomWinre $base $osDisk.Number `
             $osPartition.PartitionNumber $newPart.PartitionNumber `
             $systemPart.PartitionNumber $diskId `
@@ -957,103 +1008,28 @@ if ($Prepare -or $Create) {
             throw 'Copied WIM failed SHA-256 verification.'
         }
         Write-Manifest $paths $newPart 'Prepared' $hash $null
-        Set-Partition -DiskNumber $osDisk.Number -PartitionNumber $newPart.PartitionNumber `
-            -GptType '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
-        $attributeFile = Join-Path $WorkingRoot 'RecoveryAttributes.txt'
-@"
-select disk $($osDisk.Number)
-select partition $($newPart.PartitionNumber)
-gpt attributes=0x8000000000000001
-remove letter=$RecoveryLetter
-exit
-"@ | Set-Content $attributeFile -Encoding ASCII
-        Invoke-Native diskpart.exe @('/s', $attributeFile)
-        if ($Create -and $removeOriginalWinreApproved) {
-            Write-Host ('Prepared successfully. Factory Recovery is right-aligned, ' +
-                'Windows reclaimed the old WinRE space, and WinRE will now be integrated.') `
-                -ForegroundColor Green
-        } else {
-            Write-Host 'Prepared successfully. BCD and WinRE were not changed.' `
-                -ForegroundColor Green
+        $newPart = Get-VerifiedPartitionAtOffset -DiskNumber $osDisk.Number `
+            -Offset ([uint64]$newPart.Offset) -Size ([uint64]$newPart.Size) `
+            -Purpose 'populated Factory Recovery partition'
+        if ($newPart.GptType -ne '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}') {
+            throw 'Factory Recovery GPT type verification failed.'
         }
+        Assert-BootLayoutUnchanged -ExpectedOs $shrunkOs -ExpectedSystem $systemPart
+        Set-Partition -InputObject $newPart -NoDefaultDriveLetter $true
+        Remove-TemporaryAccessPath -DiskNumber $newPart.DiskNumber `
+            -PartitionNumber $newPart.PartitionNumber -Letter $RecoveryLetter
+        Write-Host 'Prepared successfully. BCD and WinRE were not changed.' `
+            -ForegroundColor Green
         if ($Prepare) {
             Write-Host 'Reboot and confirm normal Windows startup before --integrate.'
         } else {
             Write-Host 'Preparation verified; continuing to integration.'
         }
     } catch {
-        $prepareError = $_
-        if ($Create -and $removeOriginalWinreApproved) {
-            Write-Warning 'Right-aligned preparation failed; restoring the original disk layout.'
-            try {
-                if (-not (Get-Partition `
-                        -DiskNumber $originalWinrePart.DiskNumber `
-                        -PartitionNumber $originalWinrePart.PartitionNumber `
-                        -ErrorAction SilentlyContinue)) {
-                    $originalWinreRemoved = $true
-                }
-                if ($newPart -and (Get-Partition `
-                        -DiskNumber $newPart.DiskNumber `
-                        -PartitionNumber $newPart.PartitionNumber `
-                        -ErrorAction SilentlyContinue)) {
-                    Remove-Partition -DiskNumber $newPart.DiskNumber `
-                        -PartitionNumber $newPart.PartitionNumber `
-                        -Confirm:$false
-                }
-                $currentOs = Get-Partition -DiskNumber $osDisk.Number `
-                    -PartitionNumber $osPartition.PartitionNumber
-                if ($currentOs.Size -ne $originalOsSize) {
-                    Resize-Partition -DiskNumber $currentOs.DiskNumber `
-                        -PartitionNumber $currentOs.PartitionNumber `
-                        -Size $originalOsSize
-                }
-                if ($originalWinreRemoved) {
-                    $restoredWinre = New-Partition `
-                        -DiskNumber $originalWinrePart.DiskNumber `
-                        -Offset $originalWinrePart.Offset `
-                        -Size $originalWinrePart.Size `
-                        -DriveLetter $RecoveryLetter
-                    $restoredWinre | Format-Volume -FileSystem NTFS `
-                        -NewFileSystemLabel 'Windows RE tools' `
-                        -Confirm:$false | Out-Null
-                    $restoredRoot = "$RecoveryLetter`:\Recovery\WindowsRE"
-                    New-Item -ItemType Directory -Path $restoredRoot `
-                        -Force | Out-Null
-                    Copy-Item -LiteralPath (Join-Path `
-                            $layoutCheckpoint 'PreviousWinre.wim') `
-                        -Destination (Join-Path $restoredRoot 'Winre.wim') `
-                        -Force
-                    Set-Partition -DiskNumber $restoredWinre.DiskNumber `
-                        -PartitionNumber $restoredWinre.PartitionNumber `
-                        -GptType '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
-                    Invoke-Native reagentc.exe @(
-                        '/setreimage', '/path', $restoredRoot)
-                    Invoke-Native reagentc.exe @('/enable')
-                    $restoreAttributes = Join-Path $WorkingRoot `
-                        'RestoreOriginalWinREAttributes.txt'
-@"
-select disk $($restoredWinre.DiskNumber)
-select partition $($restoredWinre.PartitionNumber)
-gpt attributes=0x8000000000000001
-remove letter=$RecoveryLetter
-exit
-"@ | Set-Content $restoreAttributes -Encoding ASCII
-                    Invoke-Native diskpart.exe @('/s', $restoreAttributes)
-                } elseif ($winreDisabledForLayout) {
-                    Invoke-Native reagentc.exe @('/enable')
-                }
-                Write-Warning 'The original Windows and WinRE partition layout was restored.'
-            } catch {
-                throw ("Preparation failed and automatic original-layout " +
-                    "restoration also failed. Keep the machine running. " +
-                    "Checkpoint: $layoutCheckpoint`nPreparation: " +
-                    "$($prepareError.Exception.Message)`nRestoration: " +
-                    "$($_.Exception.Message)")
-            }
-        } elseif ($newPart) {
+        if ($newPart) {
             Write-Warning "Partition $($newPart.PartitionNumber) remains for inspection but is not boot-integrated."
         }
-        throw $prepareError
+        throw
     }
     if ($Prepare) { return }
     $factoryPart = Get-Partition -DiskNumber $osDisk.Number `
@@ -1082,17 +1058,18 @@ try {
                 throw "Legacy package adoption failed; missing $legacyFile."
             }
         }
-        Write-Warning 'Legacy/incomplete package detected. A successful update will adopt it as schema 3.'
+        Write-Warning 'Legacy/incomplete package detected. A successful update will adopt it as schema 4.'
         $manifest = [pscustomobject]@{
             Status = 'Prepared'
             LoaderGuid = $null
             RamdiskGuid = $null
         }
     } else {
-        $manifest = Assert-Package $paths $factoryPart
+        $manifest = Assert-Package $paths $factoryPart `
+            -AllowLegacyPartitionNumberDrift:$Update
     }
     if ($Integrate) {
-        $AllowedImageIndexes = @(if ($manifest.SchemaVersion -eq 3) {
+        $AllowedImageIndexes = @(if ($manifest.SchemaVersion -in @(3, 4)) {
             $manifest.AllowedImageIndexes | ForEach-Object { [int] $_ }
         } else {
             [int] $manifest.ImageIndex
@@ -1370,9 +1347,6 @@ try {
         if ($oldWinrePath) {
             & reagentc.exe /setreimage /path $oldWinrePath | Out-Null
             if ($registration.Enabled) { & reagentc.exe /enable | Out-Null }
-        } elseif ($Create -and $removeOriginalWinreApproved) {
-            & reagentc.exe /setreimage /path $paths.RecoveryRoot | Out-Null
-            & reagentc.exe /enable | Out-Null
         }
         & bcdedit.exe /import $bcdBackup | Out-Null
         if ($LASTEXITCODE -ne 0) {
