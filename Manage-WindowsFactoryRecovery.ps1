@@ -203,6 +203,37 @@ function Invoke-Native {
     if ($LASTEXITCODE -ne 0) { throw "'$File' failed with exit code $LASTEXITCODE." }
 }
 
+function Invoke-NativeConsole {
+    param([string] $File, [string[]] $Arguments = @())
+
+    # DISM redraws one progress line with carriage returns. Routing that output
+    # through PowerShell's success stream (especially through Out-Host) turns
+    # every redraw into a separate line. An attached child process preserves
+    # the native console handle and DISM's intended in-place progress display.
+    $startArguments = @($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + $_.Replace('"', '\"') + '"'
+        } else {
+            $_
+        }
+    })
+    Write-Verbose "$File $($startArguments -join ' ')"
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = $File
+    $processInfo.Arguments = $startArguments -join ' '
+    $processInfo.UseShellExecute = $false
+    $processInfo.CreateNoWindow = $false
+
+    $process = [System.Diagnostics.Process]::Start($processInfo)
+    if ($null -eq $process) {
+        throw "Failed to start '$File'."
+    }
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) {
+        throw "'$File' failed with exit code $($process.ExitCode)."
+    }
+}
+
 function Read-YesNo {
     param([Parameter(Mandatory)][string] $Prompt)
     while ($true) {
@@ -262,8 +293,14 @@ function Get-WinreRegistration {
     $location = [regex]::Match($text,
         'harddisk(?<disk>\d+)\\partition(?<part>\d+)',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    # The status label and value are localized, but an enabled registration
+    # always reports a GLOBALROOT harddisk/partition location. Keep the English
+    # status check for clarity and use the location as the locale-independent
+    # signal.
+    $enabled = $text -match '(?im)Windows RE status:\s*Enabled' -or
+        $location.Success
     [pscustomobject]@{
-        Enabled = $text -match '(?im)Windows RE status:\s*Enabled'
+        Enabled = $enabled
         DiskNumber = if ($location.Success) { [int]$location.Groups['disk'].Value } else { $null }
         PartitionNumber = if ($location.Success) { [int]$location.Groups['part'].Value } else { $null }
         Raw = $text
@@ -406,8 +443,8 @@ function New-CustomWinre {
     Copy-Item $BaseWinre $normal -Force
     $mounted = $false
     try {
-        Invoke-Native dism.exe @('/Mount-Image', "/ImageFile:$normal",
-            '/Index:1', "/MountDir:$MountPath") | Out-Host
+        Invoke-NativeConsole dism.exe @('/Mount-Image', "/ImageFile:$normal",
+            '/Index:1', "/MountDir:$MountPath")
         $mounted = $true
         $tools = Join-Path $MountPath 'Sources\Recovery\Tools'
         New-Item -ItemType Directory -Path $tools -Force | Out-Null
@@ -562,19 +599,19 @@ wpeutil reboot
 '@ | Set-Content `
             (Join-Path $MountPath 'Windows\System32\winpeshl.ini') `
             -Encoding ASCII
-        Invoke-Native dism.exe @('/Unmount-Image', "/MountDir:$MountPath", '/Commit') |
-            Out-Host
+        Invoke-NativeConsole dism.exe @(
+            '/Unmount-Image', "/MountDir:$MountPath", '/Commit')
         $mounted = $false
         Copy-Item $normal $factory -Force
-        Invoke-Native dism.exe @('/Mount-Image', "/ImageFile:$factory",
-            '/Index:1', "/MountDir:$MountPath") | Out-Host
+        Invoke-NativeConsole dism.exe @('/Mount-Image', "/ImageFile:$factory",
+            '/Index:1', "/MountDir:$MountPath")
         $mounted = $true
         @'
 [LaunchApps]
 "%SYSTEMROOT%\System32\cmd.exe","/d /c X:\Sources\Recovery\Tools\RestoreFactory.cmd"
 '@ | Set-Content (Join-Path $MountPath 'Windows\System32\winpeshl.ini') -Encoding ASCII
-        Invoke-Native dism.exe @('/Unmount-Image', "/MountDir:$MountPath", '/Commit') |
-            Out-Host
+        Invoke-NativeConsole dism.exe @(
+            '/Unmount-Image', "/MountDir:$MountPath", '/Commit')
         $mounted = $false
         [pscustomobject]@{ WinRE = $normal; FactoryRE = $factory }
     } finally {
@@ -591,8 +628,8 @@ function New-CleanWinre {
     Copy-Item -LiteralPath $SourceWinre -Destination $clean -Force
     $mounted = $false
     try {
-        Invoke-Native dism.exe @('/Mount-Image', "/ImageFile:$clean",
-            '/Index:1', "/MountDir:$MountPath") | Out-Host
+        Invoke-NativeConsole dism.exe @('/Mount-Image', "/ImageFile:$clean",
+            '/Index:1', "/MountDir:$MountPath")
         $mounted = $true
         $tools = Join-Path $MountPath 'Sources\Recovery\Tools'
         foreach ($name in @(
@@ -622,8 +659,8 @@ function New-CleanWinre {
 '@ | Set-Content `
             (Join-Path $MountPath 'Windows\System32\winpeshl.ini') `
             -Encoding ASCII
-        Invoke-Native dism.exe @('/Unmount-Image', "/MountDir:$MountPath",
-            '/Commit') | Out-Host
+        Invoke-NativeConsole dism.exe @(
+            '/Unmount-Image', "/MountDir:$MountPath", '/Commit')
         $mounted = $false
         $validation = & dism.exe /English /Get-WimInfo `
             "/WimFile:$clean" /Index:1 2>&1
@@ -888,12 +925,6 @@ if ($RemoveOriginalWinre) {
     if (-not $factoryPart) {
         throw "No $RecoveryLabel partition exists."
     }
-    if (-not $registration.Enabled -or
-        $registration.DiskNumber -ne $factoryPart.DiskNumber -or
-        $registration.PartitionNumber -ne $factoryPart.PartitionNumber) {
-        throw ('Original WinRE removal requires WinRE to be enabled and ' +
-            'registered on Factory Recovery.')
-    }
     $legacyCandidates = @(Get-Partition -DiskNumber $osDisk.Number |
         Where-Object {
             $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' -and
@@ -957,7 +988,13 @@ if ($RemoveOriginalWinre) {
     Write-Host ("  Remove  : legacy WinRE on disk " +
         "$($legacyWinreCandidate.DiskNumber), partition " +
         "$($legacyWinreCandidate.PartitionNumber)")
-    Write-Host '  Verify  : Factory Recovery is the enabled WinRE target'
+    if ($registration.Enabled -and
+        $registration.DiskNumber -eq $factoryPart.DiskNumber -and
+        $registration.PartitionNumber -eq $factoryPart.PartitionNumber) {
+        Write-Host '  WinRE   : verify Factory Recovery remains the enabled target'
+    } else {
+        Write-Host '  WinRE   : checkpoint and register the verified Factory Recovery image'
+    }
     Write-Host '  Reclaim : extend Factory Recovery into the released space'
 } elseif ($RemoveFactory -and $factoryPart) {
     Write-Host "  Remove  : factory recovery on disk $($factoryPart.DiskNumber), partition $($factoryPart.PartitionNumber)"
@@ -1134,11 +1171,6 @@ try {
         }
 
         $registrationCheck = Get-WinreRegistration
-        if (-not $registrationCheck.Enabled -or
-            $registrationCheck.DiskNumber -ne $factoryPart.DiskNumber -or
-            $registrationCheck.PartitionNumber -ne $factoryPart.PartitionNumber) {
-            throw 'WinRE is no longer verified on Factory Recovery; removal is refused.'
-        }
         $verifiedLegacy = Get-VerifiedPartitionAtOffset `
             -DiskNumber $legacyWinreCandidate.DiskNumber `
             -Offset ([uint64]$legacyWinreCandidate.Offset) `
@@ -1194,6 +1226,73 @@ try {
                 Set-Content (Join-Path $checkpoint 'Partition.json') -Encoding UTF8
             Copy-Item -LiteralPath $paths.Manifest `
                 -Destination (Join-Path $checkpoint 'Manifest-before.json') -Force
+            $registrationCheck.Raw |
+                Set-Content (Join-Path $checkpoint 'ReAgent-before.txt') `
+                    -Encoding UTF8
+            $bcdBackup = Join-Path $checkpoint 'BCD'
+            Invoke-Native bcdedit.exe @('/export', $bcdBackup)
+
+            $factoryIsActiveWinre = $registrationCheck.Enabled -and
+                $registrationCheck.DiskNumber -eq $factoryPart.DiskNumber -and
+                $registrationCheck.PartitionNumber -eq
+                    $factoryPart.PartitionNumber
+            if (-not $factoryIsActiveWinre) {
+                $registeredOnLegacy = $registrationCheck.Enabled -and
+                    $registrationCheck.DiskNumber -eq $verifiedLegacy.DiskNumber -and
+                    $registrationCheck.PartitionNumber -eq
+                        $verifiedLegacy.PartitionNumber
+                if ($registrationCheck.Enabled -and -not $registeredOnLegacy) {
+                    throw ('WinRE is registered on an unexpected partition. ' +
+                        'No registration or partition changes were made.')
+                }
+
+                Write-Warning ('WinRE is not currently registered on Factory ' +
+                    'Recovery. Registering and verifying it before deletion.')
+                $registrationMutationStarted = $false
+                try {
+                    if ($registrationCheck.Enabled) {
+                        $registrationMutationStarted = $true
+                        Invoke-Native reagentc.exe @('/disable')
+                    }
+                    $registrationMutationStarted = $true
+                    Invoke-Native reagentc.exe @(
+                        '/setreimage', '/path', $paths.RecoveryRoot)
+                    @'
+<?xml version="1.0" encoding="utf-8"?>
+<BootShell><WinRETool locale="en-us">
+<Name>Factory Recovery</Name>
+<Description>Restore the factory system image</Description>
+</WinRETool></BootShell>
+'@ | Set-Content (Join-Path $checkpoint 'BootShell.xml') -Encoding UTF8
+                    Invoke-Native reagentc.exe @(
+                        '/setbootshelllink', '/configfile',
+                        (Join-Path $checkpoint 'BootShell.xml'))
+                    Invoke-Native reagentc.exe @('/enable')
+                    $factoryRegistration = Get-WinreRegistration
+                    if (-not $factoryRegistration.Enabled -or
+                        $factoryRegistration.DiskNumber -ne
+                            $factoryPart.DiskNumber -or
+                        $factoryRegistration.PartitionNumber -ne
+                            $factoryPart.PartitionNumber) {
+                        throw 'Factory Recovery WinRE registration did not verify.'
+                    }
+                }
+                catch {
+                    $registrationFailure = $_
+                    if ($registrationMutationStarted) {
+                        Write-Warning ('Factory WinRE registration failed; ' +
+                            'restoring the previous registration and BCD.')
+                        & reagentc.exe /disable *> $null
+                        if ($registeredOnLegacy) {
+                            & reagentc.exe /setreimage /path `
+                                "$legacyActiveLetter`:\Recovery\WindowsRE" *> $null
+                            & reagentc.exe /enable *> $null
+                        }
+                        & bcdedit.exe /import $bcdBackup *> $null
+                    }
+                    throw $registrationFailure
+                }
+            }
         }
         finally {
             if ($legacyAccessAdded) {
@@ -1253,7 +1352,7 @@ try {
                 RamdiskGuid = $manifest.RamdiskGuid
             }
         } else { $null }
-        Write-Manifest $paths $expandedFactory $manifest.Status `
+        Write-Manifest $paths $expandedFactory 'Integrated' `
             $manifest.ImageSha256 $existingBcd
         $manifest = Assert-Package $paths $expandedFactory
         Assert-BootLayoutUnchanged -ExpectedOs $osPartition `

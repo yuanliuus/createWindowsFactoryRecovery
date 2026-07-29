@@ -166,6 +166,11 @@ The normal WinRE image receives an explicit `Winpeshl.ini` that initializes
 WinPE and launches `RecEnv.exe`. Without that shell entry, WinPE falls back to
 `Startnet.cmd` and stops at a command prompt after `wpeinit`.
 
+DISM mount/commit operations run with their native console handle attached.
+PowerShell pipelines convert DISM's carriage-return redraws into separate output
+records, producing one progress bar per percentage. Direct console execution
+keeps DISM's progress on a single updating line.
+
 It does **not** call `bcdedit` or modify REAgentC. Existing WinRE is preserved.
 Reboot and verify ordinary Windows startup before continuing.
 
@@ -280,16 +285,20 @@ To remove it after integration:
 .\Manage-WindowsFactoryRecovery.ps1 --remove-original-winre
 ```
 
-The operation requires Factory Recovery to be the enabled REAgentC target and
-requires exactly one other Microsoft recovery partition directly after Factory
-Recovery. It validates the installed package, requires typing
-`REMOVE-ORIGINAL-WINRE`, temporarily mounts the legacy partition, backs up its
-`Winre.wim`, hash, and layout metadata, then deletes only the revalidated
-partition object. It extends Factory Recovery only into the directly adjacent
-released extent, verifies the new right boundary, and rewrites the schema-4
-manifest with the expanded size. Windows is not resized. If any identity,
-adjacency, file, registration, expansion, or manifest check fails, the operation
-stops and reports the checkpoint.
+The operation requires exactly one other Microsoft recovery partition directly
+after Factory Recovery. It validates the installed package, requires typing
+`REMOVE-ORIGINAL-WINRE`, temporarily mounts the legacy partition, and backs up
+its `Winre.wim`, hash, layout metadata, REAgentC state, and BCD. If WinRE is
+disabled or still registered on that legacy partition, the operation registers
+the verified Factory Recovery image and confirms the new target before any
+partition is deleted. An unexpected third-party WinRE target is refused.
+
+It then deletes only the revalidated legacy partition object, extends Factory
+Recovery only into the directly adjacent released extent, verifies the new
+right boundary, and rewrites the schema-4 manifest with the expanded size.
+Windows is not resized. If any identity, adjacency, file, registration,
+expansion, or manifest check fails, the operation stops and reports the
+checkpoint.
 
 ## Verification
 
