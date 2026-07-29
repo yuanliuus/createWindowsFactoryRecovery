@@ -4,6 +4,25 @@
 removes a local factory-recovery package made from a captured WIM. Installation
 separates partition work from boot configuration.
 
+## Interactive one-line launcher
+
+Open Windows PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/yuanliuus/createWindowsFactoryRecovery/main/Invoke-WindowsFactoryRecovery.ps1 | iex
+```
+
+The launcher presents a menu for a read-only plan, preparation, integration,
+image update, complete removal, or help. It downloads the current manager to a
+temporary file, displays its SHA-256 hash, requests UAC elevation when needed,
+and removes the temporary copy afterward. All confirmations and safety checks
+in the full manager remain active.
+
+`irm ... | iex` executes code obtained from the network. Review the
+[bootstrap source](https://github.com/yuanliuus/createWindowsFactoryRecovery/blob/main/Invoke-WindowsFactoryRecovery.ps1)
+before using it, and use a commit-specific raw URL when reproducible,
+version-pinned behavior is required.
+
 ## Important safety rules
 
 - Run from elevated **Windows PowerShell 5.1**.
