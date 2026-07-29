@@ -24,10 +24,10 @@ $managerUrl =
 function Read-MenuChoice {
     while ($true) {
         $answer = (Read-Host 'Choose an operation').Trim().ToLowerInvariant()
-        if ($answer -in @('1', '2', '3', '4', '5', '6', 'h', 'q')) {
+        if ($answer -in @('1', '2', '3', '4', '5', '6', '7', 'h', 'q')) {
             return $answer
         }
-        Write-Host 'Enter 1, 2, 3, 4, 5, 6, h, or q.' -ForegroundColor Yellow
+        Write-Host 'Enter 1, 2, 3, 4, 5, 6, 7, h, or q.' -ForegroundColor Yellow
     }
 }
 
@@ -83,6 +83,7 @@ Write-Host '  3  Prepare the recovery partition and files only'
 Write-Host '  4  Integrate a prepared package with BCD and WinRE'
 Write-Host '  5  Update an existing factory image'
 Write-Host '  6  Remove Factory Recovery completely'
+Write-Host '  7  Remove verified original WinRE partition'
 Write-Host '  h  Show manager help'
 Write-Host '  q  Quit'
 Write-Host ''
@@ -109,6 +110,7 @@ switch ($choice) {
         $managerArguments.Add('--update')
     }
     '6' { $managerArguments.Add('--remove') }
+    '7' { $managerArguments.Add('--remove-original-winre') }
     'h' { $managerArguments.Add('--help') }
 }
 

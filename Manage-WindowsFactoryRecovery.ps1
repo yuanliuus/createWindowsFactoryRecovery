@@ -106,12 +106,15 @@ USAGE
   .\Manage-WindowsFactoryRecovery.ps1 --remove
       Remove verified factory recovery and reclaim its partition space.
 
+  .\Manage-WindowsFactoryRecovery.ps1 --remove-original-winre
+      Remove one verified legacy WinRE partition after factory integration.
+
 OPTIONS
   --image-path, -i <path>        Captured WIM
   --image-index, -n <number>     Lock recovery to one index; default allows all
   --recovery-size-gb, -s <GB>    New partition size; default 20
   --create, -c                    Guided plan, prepare, and integrate workflow
-  --remove-original-winre, -o     Disabled: original WinRE is always preserved
+  --remove-original-winre, -o     Remove verified legacy WinRE after integration
   --prepare, -p                   Partition/file preparation only
   --integrate, -g                 BCD/WinRE integration only
   --update, -u                    Existing package file update only
@@ -121,9 +124,10 @@ OPTIONS
   --help, -h                      This help
 
 SAFETY
-  Existing WinRE is always preserved. Live deletion/recreation of the original
-  WinRE partition is disabled after a boot-disk incident. Integration asks
-  before adding a Boot Manager entry.
+  Preparation always preserves existing WinRE. Original WinRE removal is a
+  separate post-integration operation and extends Factory Recovery only into
+  the verified adjacent released space.
+  Integration asks before adding a Boot Manager entry.
   Normal Windows remains the default boot entry.
   Removal requires typing REMOVE-FACTORY and creates a BCD checkpoint.
 '@ | Write-Host
@@ -131,14 +135,9 @@ SAFETY
 }
 
 $modeCount = @(
-    $Create, $Prepare, $Integrate, $Update, $RemoveFactory
+    $Create, $RemoveOriginalWinre, $Prepare, $Integrate, $Update, $RemoveFactory
 ).Where({ $_ }).Count
 if ($modeCount -gt 1) { throw 'Use only one operation option.' }
-if ($RemoveOriginalWinre) {
-    throw ('--remove-original-winre is disabled. Live replacement of the ' +
-        'original WinRE partition is not safe; create Factory Recovery while ' +
-        'preserving the original partition.')
-}
 if ($Create -and -not $WhatIfPreference) {
     Write-Host ''
     Write-Host 'FACTORY RECOVERY CREATE WORKFLOW' -ForegroundColor Cyan
@@ -175,7 +174,7 @@ if ($Create -and -not $WhatIfPreference) {
         }
     }
 }
-if (-not $Integrate -and -not $RemoveFactory -and
+if (-not $Integrate -and -not $RemoveFactory -and -not $RemoveOriginalWinre -and
     [string]::IsNullOrWhiteSpace($ImagePath)) {
     throw '--image-path is required for plan, prepare, and update.'
 }
@@ -875,6 +874,7 @@ if ($factoryVolumes.Count -gt 1) { throw "Multiple $RecoveryLabel volumes exist.
 $factoryVolume = $factoryVolumes | Select-Object -First 1
 $factoryPart = if ($factoryVolume) { Get-Partition -Volume $factoryVolume } else { $null }
 $originalWinrePart = $null
+$legacyWinreCandidate = $null
 
 if ($osDisk.PartitionStyle -ne 'GPT') { throw 'Only GPT/UEFI is supported.' }
 if (-not $osDisk.IsBoot -or -not $osDisk.IsSystem -or
@@ -883,6 +883,34 @@ if (-not $osDisk.IsBoot -or -not $osDisk.IsSystem -or
 }
 if ($factoryPart -and $factoryPart.DiskNumber -ne $osDisk.Number) {
     throw "$RecoveryLabel is not on the Windows disk."
+}
+if ($RemoveOriginalWinre) {
+    if (-not $factoryPart) {
+        throw "No $RecoveryLabel partition exists."
+    }
+    if (-not $registration.Enabled -or
+        $registration.DiskNumber -ne $factoryPart.DiskNumber -or
+        $registration.PartitionNumber -ne $factoryPart.PartitionNumber) {
+        throw ('Original WinRE removal requires WinRE to be enabled and ' +
+            'registered on Factory Recovery.')
+    }
+    $legacyCandidates = @(Get-Partition -DiskNumber $osDisk.Number |
+        Where-Object {
+            $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' -and
+            $_.PartitionNumber -ne $factoryPart.PartitionNumber -and
+            $_.PartitionNumber -ne $osPartition.PartitionNumber -and
+            $_.PartitionNumber -ne $systemPart.PartitionNumber
+        })
+    if ($legacyCandidates.Count -ne 1) {
+        throw ("Expected exactly one legacy recovery partition; found " +
+            "$($legacyCandidates.Count). Removal is refused.")
+    }
+    $legacyWinreCandidate = $legacyCandidates[0]
+    if (($factoryPart.Offset + $factoryPart.Size) -ne
+        $legacyWinreCandidate.Offset) {
+        throw ('The legacy recovery partition is not directly after Factory ' +
+            'Recovery. Removal is refused.')
+    }
 }
 if ($Create -and $registration.Enabled -and
     $null -ne $registration.DiskNumber -and
@@ -925,7 +953,13 @@ if ($image) {
     }
     Write-Host "  Size    : $([math]::Round($image.Length / 1GB, 2)) GB"
 }
-if ($RemoveFactory -and $factoryPart) {
+if ($RemoveOriginalWinre) {
+    Write-Host ("  Remove  : legacy WinRE on disk " +
+        "$($legacyWinreCandidate.DiskNumber), partition " +
+        "$($legacyWinreCandidate.PartitionNumber)")
+    Write-Host '  Verify  : Factory Recovery is the enabled WinRE target'
+    Write-Host '  Reclaim : extend Factory Recovery into the released space'
+} elseif ($RemoveFactory -and $factoryPart) {
     Write-Host "  Remove  : factory recovery on disk $($factoryPart.DiskNumber), partition $($factoryPart.PartitionNumber)"
     Write-Host '  Reclaim : delete only the verified factory partition and extend Windows'
     Write-Host '  WinRE   : preserve a cleaned standard WinRE image and re-enable it'
@@ -936,7 +970,9 @@ if ($RemoveFactory -and $factoryPart) {
 } else {
     Write-Host "  Factory : new $RecoverySizeGB GB partition"
 }
-if ($originalWinrePart) {
+if ($RemoveOriginalWinre) {
+    Write-Host "  Old WinRE: remove partition $($legacyWinreCandidate.PartitionNumber)"
+} elseif ($originalWinrePart) {
     Write-Host "  Old WinRE: preserve partition $($originalWinrePart.PartitionNumber)"
 } else {
     Write-Host '  Old WinRE: preserve any existing recovery partition'
@@ -1081,6 +1117,159 @@ try {
         } else {
             [int] $manifest.ImageIndex
         })
+    }
+    if ($RemoveOriginalWinre) {
+        Write-Warning ('This permanently deletes the verified legacy WinRE ' +
+            'partition and extends Factory Recovery into its released space.')
+        if ((Read-Host 'Type REMOVE-ORIGINAL-WINRE to continue') -cne
+            'REMOVE-ORIGINAL-WINRE') {
+            Write-Host 'Original WinRE removal cancelled; no changes made.'
+            return
+        }
+        if (-not $PSCmdlet.ShouldProcess(
+                "disk $($legacyWinreCandidate.DiskNumber), partition " +
+                "$($legacyWinreCandidate.PartitionNumber)",
+                'remove verified legacy WinRE partition')) {
+            return
+        }
+
+        $registrationCheck = Get-WinreRegistration
+        if (-not $registrationCheck.Enabled -or
+            $registrationCheck.DiskNumber -ne $factoryPart.DiskNumber -or
+            $registrationCheck.PartitionNumber -ne $factoryPart.PartitionNumber) {
+            throw 'WinRE is no longer verified on Factory Recovery; removal is refused.'
+        }
+        $verifiedLegacy = Get-VerifiedPartitionAtOffset `
+            -DiskNumber $legacyWinreCandidate.DiskNumber `
+            -Offset ([uint64]$legacyWinreCandidate.Offset) `
+            -Size ([uint64]$legacyWinreCandidate.Size) `
+            -Purpose 'legacy WinRE partition'
+        if ($verifiedLegacy.GptType -ne
+                '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' -or
+            ($factoryPart.Offset + $factoryPart.Size) -ne
+                $verifiedLegacy.Offset) {
+            throw 'Legacy WinRE identity changed; removal is refused.'
+        }
+
+        $legacyLetter = @('Q', 'T', 'U', 'V', 'P') |
+            Where-Object {
+                $_ -ne $activeLetter -and -not (Test-Path "$_`:\")
+            } | Select-Object -First 1
+        if (-not $legacyLetter) {
+            throw 'No temporary drive letter is available for legacy WinRE verification.'
+        }
+        $legacyVolume = Get-Volume -Partition $verifiedLegacy
+        $legacyAccessAdded = -not $legacyVolume.DriveLetter
+        $legacyActiveLetter = if ($legacyAccessAdded) {
+            $legacyLetter
+        } else {
+            $legacyVolume.DriveLetter.ToString()
+        }
+        $checkpoint = Join-Path $WorkingRoot `
+            ('RemoveOriginalWinRE-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        New-Item -ItemType Directory -Path $checkpoint -Force | Out-Null
+        try {
+            if ($legacyAccessAdded) {
+                Add-PartitionAccessPath -InputObject $verifiedLegacy `
+                    -AccessPath "$legacyActiveLetter`:\"
+            }
+            $legacyImage = "$legacyActiveLetter`:\Recovery\WindowsRE\Winre.wim"
+            if (-not (Test-Path -LiteralPath $legacyImage -PathType Leaf)) {
+                throw 'Legacy Winre.wim was not found; removal is refused.'
+            }
+            Copy-Item -LiteralPath $legacyImage `
+                -Destination (Join-Path $checkpoint 'PreviousWinre.wim') -Force
+            (Get-FileHash -LiteralPath $legacyImage -Algorithm SHA256).Hash |
+                Set-Content (Join-Path $checkpoint 'PreviousWinre.sha256') `
+                    -Encoding ASCII
+            [ordered]@{
+                DiskId = $diskId
+                DiskNumber = $verifiedLegacy.DiskNumber
+                PartitionNumber = $verifiedLegacy.PartitionNumber
+                Offset = [uint64]$verifiedLegacy.Offset
+                Size = [uint64]$verifiedLegacy.Size
+                GptType = $verifiedLegacy.GptType
+                RemovedUtc = [DateTime]::UtcNow.ToString('o')
+            } | ConvertTo-Json |
+                Set-Content (Join-Path $checkpoint 'Partition.json') -Encoding UTF8
+            Copy-Item -LiteralPath $paths.Manifest `
+                -Destination (Join-Path $checkpoint 'Manifest-before.json') -Force
+        }
+        finally {
+            if ($legacyAccessAdded) {
+                Remove-TemporaryAccessPath `
+                    -DiskNumber $verifiedLegacy.DiskNumber `
+                    -PartitionNumber $verifiedLegacy.PartitionNumber `
+                    -Letter $legacyActiveLetter
+            }
+        }
+
+        $verifiedLegacy = Get-VerifiedPartitionAtOffset `
+            -DiskNumber $legacyWinreCandidate.DiskNumber `
+            -Offset ([uint64]$legacyWinreCandidate.Offset) `
+            -Size ([uint64]$legacyWinreCandidate.Size) `
+            -Purpose 'legacy WinRE partition before deletion'
+        Remove-Partition -InputObject $verifiedLegacy -Confirm:$false
+        $remainingAtOffset = @(Get-Partition `
+            -DiskNumber $legacyWinreCandidate.DiskNumber |
+            Where-Object {
+                [uint64]$_.Offset -eq [uint64]$legacyWinreCandidate.Offset
+            })
+        if ($remainingAtOffset.Count) {
+            throw 'Legacy WinRE partition still exists after removal.'
+        }
+        $factoryBeforeExpand = Get-VerifiedPartitionAtOffset `
+            -DiskNumber $factoryPart.DiskNumber `
+            -Offset ([uint64]$factoryPart.Offset) `
+            -Size ([uint64]$factoryPart.Size) `
+            -Purpose 'Factory Recovery partition before expansion'
+        $factorySupported = Get-PartitionSupportedSize `
+            -DiskNumber $factoryBeforeExpand.DiskNumber `
+            -PartitionNumber $factoryBeforeExpand.PartitionNumber
+        if ($factorySupported.SizeMax -le $factoryBeforeExpand.Size) {
+            throw ('Legacy WinRE was removed, but Factory Recovery cannot be ' +
+                "expanded. Backup checkpoint: $checkpoint")
+        }
+        Resize-Partition -InputObject $factoryBeforeExpand `
+            -Size $factorySupported.SizeMax
+        $expandedFactory = Get-VerifiedPartitionAtOffset `
+            -DiskNumber $factoryBeforeExpand.DiskNumber `
+            -Offset ([uint64]$factoryBeforeExpand.Offset) `
+            -Size ([uint64]$factorySupported.SizeMax) `
+            -Purpose 'expanded Factory Recovery partition'
+        if (($expandedFactory.Offset + $expandedFactory.Size) -ne
+            ($legacyWinreCandidate.Offset + $legacyWinreCandidate.Size)) {
+            throw ('Factory Recovery expansion did not consume exactly the ' +
+                "released legacy extent. Backup checkpoint: $checkpoint")
+        }
+        $AllowedImageIndexes = @(if ($manifest.SchemaVersion -in @(3, 4)) {
+            $manifest.AllowedImageIndexes | ForEach-Object { [int] $_ }
+        } else {
+            [int]$manifest.ImageIndex
+        })
+        $existingBcd = if ($manifest.LoaderGuid -and $manifest.RamdiskGuid) {
+            [pscustomobject]@{
+                LoaderGuid = $manifest.LoaderGuid
+                RamdiskGuid = $manifest.RamdiskGuid
+            }
+        } else { $null }
+        Write-Manifest $paths $expandedFactory $manifest.Status `
+            $manifest.ImageSha256 $existingBcd
+        $manifest = Assert-Package $paths $expandedFactory
+        Assert-BootLayoutUnchanged -ExpectedOs $osPartition `
+            -ExpectedSystem $systemPart
+        $registrationAfterRemoval = Get-WinreRegistration
+        if (-not $registrationAfterRemoval.Enabled -or
+            $registrationAfterRemoval.DiskNumber -ne $factoryPart.DiskNumber -or
+            $registrationAfterRemoval.PartitionNumber -ne
+                $factoryPart.PartitionNumber) {
+            throw ('Legacy partition was removed, but Factory Recovery WinRE ' +
+                'registration no longer verifies. Do not reboot until investigated.')
+        }
+        Write-Host ('Original WinRE was removed and Factory Recovery was ' +
+            'extended into the released space.') -ForegroundColor Green
+        Write-Host "Backup checkpoint: $checkpoint"
+        return
     }
     if ($RemoveFactory) {
         $factoryIsActiveWinre = $registration.DiskNumber -eq $factoryPart.DiskNumber -and

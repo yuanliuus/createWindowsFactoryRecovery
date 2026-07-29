@@ -24,6 +24,7 @@ foreach ($required in @(
         '--integrate',
         '--update',
         '--remove',
+        '--remove-original-winre',
         'Get-FileHash',
         'Start-Process',
         '-Verb RunAs',
