@@ -32,8 +32,8 @@ version-pinned behavior is required.
   VHD/VHDX boot, and multi-disk boot layouts are refused.
 - Keep tested Windows installation/recovery USB media available.
 - Suspend BitLocker before a modifying operation.
-- Existing WinRE is always preserved. Live deletion/recreation of the original
-  WinRE partition is disabled after a boot-disk incident.
+- Preparation always preserves existing WinRE. A separate post-integration
+  operation can delete one verified adjacent legacy WinRE partition.
 - The script never automatically recreates or enlarges an existing factory
   partition. That operation is intentionally offline/manual.
 - Removal deletes only a `FACTORY_RECOVERY` partition whose supported manifest
@@ -55,7 +55,7 @@ executable; renamed system tools cannot reliably resolve their MUI messages.
 | `--image-index` | `-n` | Lock recovery to one index; default allows all |
 | `--recovery-size-gb` | `-s` | New partition size; default 20 |
 | `--create` | `-c` | Guided plan, prepare, and integrate workflow |
-| `--remove-original-winre` | `-o` | Disabled; exits without changing disk state |
+| `--remove-original-winre` | `-o` | Remove verified legacy WinRE after integration |
 | `--prepare` | `-p` | Create/populate only |
 | `--integrate` | `-g` | BCD and WinRE integration only |
 | `--update` | `-u` | Update existing recovery files only |
@@ -121,10 +121,10 @@ fails, integration is never attempted. If integration fails, its BCD and WinRE
 rollback remains active while the prepared partition is retained for
 inspection.
 
-The old `--remove-original-winre` option is retained only to fail closed with an
-explanation. It performs no discovery or mutation. Removing or relocating an
-existing WinRE partition requires tested offline servicing and is outside this
-script.
+`--create` and `--prepare` never delete the original WinRE partition. After
+Factory Recovery has been integrated and verified as the enabled WinRE target,
+run `--remove-original-winre` separately if the legacy partition should be
+deleted.
 
 Parameters can also be supplied in advance for unattended parameter entry
 while retaining confirmations:
@@ -273,10 +273,23 @@ a later step fails.
 
 ## Existing WinRE partition
 
-The original WinRE partition is always preserved. `--create` and `--prepare`
-place Factory Recovery in newly released space without deleting, moving, or
-retyping the original WinRE partition. The deprecated removal option fails
-before administrator discovery, WIM inspection, or any storage operation.
+The original WinRE partition is always preserved by `--create` and `--prepare`.
+To remove it after integration:
+
+```powershell
+.\Manage-WindowsFactoryRecovery.ps1 --remove-original-winre
+```
+
+The operation requires Factory Recovery to be the enabled REAgentC target and
+requires exactly one other Microsoft recovery partition directly after Factory
+Recovery. It validates the installed package, requires typing
+`REMOVE-ORIGINAL-WINRE`, temporarily mounts the legacy partition, backs up its
+`Winre.wim`, hash, and layout metadata, then deletes only the revalidated
+partition object. It extends Factory Recovery only into the directly adjacent
+released extent, verifies the new right boundary, and rewrites the schema-4
+manifest with the expanded size. Windows is not resized. If any identity,
+adjacency, file, registration, expansion, or manifest check fails, the operation
+stops and reports the checkpoint.
 
 ## Verification
 
@@ -306,7 +319,7 @@ restore script, and can match the recorded GPT disk ID.
 
 Ordinary choices accept `y`/`yes` and `n`/`no`. Critical operations deliberately
 require their full confirmation words: `PREPARE`, `UPDATE`, `RESIZE`,
-`INTEGRATE`, `REMOVE-FACTORY`, and `RESTORE`.
+`INTEGRATE`, `REMOVE-ORIGINAL-WINRE`, `REMOVE-FACTORY`, and `RESTORE`.
 
 ## Development and live test helpers
 
