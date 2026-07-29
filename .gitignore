@@ -1,0 +1,11 @@
+# Machine-specific logs and verification artifacts
+artifacts/
+*-scheduled.txt
+live-*-output.txt
+live-*-result.txt
+recovery-verifier-test.txt
+
+# PowerShell/editor temporary files
+*.tmp
+*.bak
+*~
