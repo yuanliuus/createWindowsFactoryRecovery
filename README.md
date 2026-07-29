@@ -211,9 +211,16 @@ command prompt.
   --update
 ```
 
-Type `UPDATE`. New files are staged beside the current files, the WIM is
-SHA-256 verified, and each file is replaced with a rollback copy. Update mode
-does not call `bcdedit`, REAgentC, or partition cmdlets.
+Type `UPDATE`. Replacement recovery images are built and validated in the
+working directory, then the factory WIM and recovery images are overwritten and
+SHA-256 verified in place. This does not require space for a second full WIM on
+Factory Recovery.
+
+Before the first overwrite, the manifest is marked `UpdateInProgress`.
+Integration and removal refuse that status. If copying is interrupted, rerun
+`--update` with the captured WIM; a successful run restores `Prepared` or
+`Integrated` status. Do not restart or power off during the in-place copy.
+Update mode does not call `bcdedit`, REAgentC, or partition cmdlets.
 
 If an older package has the expected three recovery images but no version-2
 manifest, a successful update adopts it into the new format. This is the safe
