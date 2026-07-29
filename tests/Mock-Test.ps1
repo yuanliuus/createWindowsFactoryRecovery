@@ -24,7 +24,10 @@ if ($parseErrors.Count) {
 
 $source = Get-Content $scriptPath -Raw
 $required = @(
-    '--prepare', '--integrate', '--update', '--remove',
+    '--create', '--prepare', '--integrate', '--update', '--remove',
+    'Continue with this workflow? [y/n]',
+    'Collect the image and recovery-size parameters.',
+    'Preparation verified; continuing to integration.',
     'user selects during recovery',
     'ImageCatalog.txt', 'ValidateImageIndex.cmd',
     'ShowImageDetails.cmd', 'ImageDetails-',
@@ -69,6 +72,7 @@ $source = $source -replace
 $production = [scriptblock]::Create($source)
 $script:Mutations = 0
 $script:MockMultipleImages = $false
+$script:CancelCreate = $false
 
 function Stop-Mutation([string] $Name) {
     $script:Mutations++
@@ -93,6 +97,10 @@ function global:dism.exe {
 }
 function global:Read-Host {
     param([string] $Prompt)
+    if ($script:CancelCreate -and
+        $Prompt -eq 'Continue with this workflow? [y/n]') {
+        return 'n'
+    }
     throw "Unexpected mock prompt: $Prompt"
 }
 function global:reagentc.exe {
@@ -156,9 +164,18 @@ try {
     Set-Content $tempImage 'mock'
 
     $help = & $production '--help' 6>&1 | Out-String
-    if ($help -notmatch '--prepare' -or $help -notmatch '--integrate' -or
+    if ($help -notmatch '--create' -or $help -notmatch '--prepare' -or
+        $help -notmatch '--integrate' -or
         $help -notmatch '--remove') {
         throw 'Help test failed.'
+    }
+
+    $script:CancelCreate = $true
+    $createCancellation = & $production '--create' 6>&1 | Out-String
+    $script:CancelCreate = $false
+    if ($createCancellation -notmatch 'FACTORY RECOVERY CREATE WORKFLOW' -or
+        $createCancellation -notmatch 'Create cancelled; no changes made.') {
+        throw 'Create workflow cancellation test failed.'
     }
 
     $plan = & $production '--image-path' $tempImage 6>&1 | Out-String
@@ -178,6 +195,7 @@ try {
     $script:MockMultipleImages = $false
 
     foreach ($arguments in @(
+        @('-i', $tempImage, '--create', '--what-if'),
         @('-i', $tempImage, '--prepare', '--what-if'),
         @('-i', $tempImage, '--update', '--what-if'),
         @('--integrate', '--what-if'),
@@ -198,6 +216,8 @@ try {
         Plan = 'PASS'
         DeferredImageSelection = 'PASS'
         LockedImageSelection = 'PASS'
+        CreateCancellation = 'PASS'
+        CreateWhatIf = 'PASS'
         PrepareWhatIf = 'PASS'
         UpdateWhatIf = 'PASS'
         IntegrateWhatIf = 'PASS'

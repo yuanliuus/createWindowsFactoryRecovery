@@ -19,6 +19,7 @@ $source = Get-Content -LiteralPath $bootstrap -Raw
 foreach ($required in @(
         'raw.githubusercontent.com/yuanliuus/createWindowsFactoryRecovery/main',
         'Show a read-only plan',
+        '--create',
         '--prepare',
         '--integrate',
         '--update',

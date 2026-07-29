@@ -6,6 +6,7 @@ Safely prepares, integrates, updates, and removes local Windows factory recovery
 
 .DESCRIPTION
 The workflow is deliberately split into independent operations:
+  --create    Plans, prepares, and integrates in one guided workflow.
   --prepare   Creates/populates the recovery partition; never changes boot data.
   --integrate Registers WinRE and adds a boot entry; never changes partitions.
   --update    Replaces recovery files with side-by-side verified copies.
@@ -29,8 +30,10 @@ $PartitionAlignmentReserve = 1MB
 $BootMenuTimeoutSeconds = 3
 $ImageIndex = 1
 $ImageIndexSpecified = $false
+$RecoverySizeSpecified = $false
 $AllowedImageIndexes = @()
 $ImagePath = $null
+$Create = $false
 $Prepare = $false
 $Integrate = $false
 $Update = $false
@@ -41,6 +44,7 @@ for ($i = 0; $i -lt $CliArguments.Count; $i++) {
     $option = $CliArguments[$i].ToLowerInvariant()
     switch ($option) {
         { $_ -in @('--help', '-h') } { $Help = $true }
+        { $_ -in @('--create', '-c') } { $Create = $true }
         { $_ -in @('--prepare', '-p') } { $Prepare = $true }
         { $_ -in @('--integrate', '-g') } { $Integrate = $true }
         { $_ -in @('--update', '-u') } { $Update = $true }
@@ -67,6 +71,7 @@ for ($i = 0; $i -lt $CliArguments.Count; $i++) {
                     throw "$option must be from 8 through 2048."
                 }
                 $RecoverySizeGB = $parsed
+                $RecoverySizeSpecified = $true
             }
         }
         default { throw "Unknown option '$($CliArguments[$i])'. Use --help." }
@@ -80,6 +85,10 @@ Windows Factory Recovery Manager
 USAGE
   .\Manage-WindowsFactoryRecovery.ps1 -i <capture.wim>
       Show a read-only plan.
+
+  .\Manage-WindowsFactoryRecovery.ps1 --create
+      Show the workflow, ask to continue, collect parameters, plan, prepare,
+      and integrate.
 
   .\Manage-WindowsFactoryRecovery.ps1 -i <capture.wim> --prepare
       Create/populate recovery without changing BCD or WinRE.
@@ -97,6 +106,7 @@ OPTIONS
   --image-path, -i <path>        Captured WIM
   --image-index, -n <number>     Lock recovery to one index; default allows all
   --recovery-size-gb, -s <GB>    New partition size; default 20
+  --create, -c                    Guided plan, prepare, and integrate workflow
   --prepare, -p                   Partition/file preparation only
   --integrate, -g                 BCD/WinRE integration only
   --update, -u                    Existing package file update only
@@ -114,8 +124,45 @@ SAFETY
     return
 }
 
-$modeCount = @($Prepare, $Integrate, $Update, $RemoveFactory).Where({ $_ }).Count
+$modeCount = @(
+    $Create, $Prepare, $Integrate, $Update, $RemoveFactory
+).Where({ $_ }).Count
 if ($modeCount -gt 1) { throw 'Use only one operation option.' }
+if ($Create -and -not $WhatIfPreference) {
+    Write-Host ''
+    Write-Host 'FACTORY RECOVERY CREATE WORKFLOW' -ForegroundColor Cyan
+    Write-Host '  1. Collect the image and recovery-size parameters.'
+    Write-Host '  2. Show the complete machine, partition, and image plan.'
+    Write-Host '  3. Prepare and verify the recovery partition and files.'
+    Write-Host '  4. Integrate the verified package with WinRE and, optionally, Boot Manager.'
+    while ($true) {
+        $answer = (Read-Host 'Continue with this workflow? [y/n]').Trim().ToLowerInvariant()
+        if ($answer -in @('y', 'yes')) { break }
+        if ($answer -in @('n', 'no')) {
+            Write-Host 'Create cancelled; no changes made.'
+            return
+        }
+        Write-Host 'Please enter y or n.' -ForegroundColor Yellow
+    }
+    if ([string]::IsNullOrWhiteSpace($ImagePath)) {
+        $ImagePath = (Read-Host 'Captured WIM path').Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($ImagePath)) {
+            throw 'A captured WIM path is required.'
+        }
+    }
+    if (-not $RecoverySizeSpecified) {
+        $sizeAnswer = (Read-Host `
+            'Recovery partition size in GB, or press Enter for 20').Trim()
+        if ($sizeAnswer) {
+            $parsedSize = 0
+            if (-not [int]::TryParse($sizeAnswer, [ref]$parsedSize) -or
+                $parsedSize -lt 8 -or $parsedSize -gt 2048) {
+                throw 'Recovery size must be from 8 through 2048 GB.'
+            }
+            $RecoverySizeGB = $parsedSize
+        }
+    }
+}
 if (-not $Integrate -and -not $RemoveFactory -and
     [string]::IsNullOrWhiteSpace($ImagePath)) {
     throw '--image-path is required for plan, prepare, and update.'
@@ -644,6 +691,24 @@ $resolvedImage = if ($ImagePath) {
     (Resolve-Path -LiteralPath $ImagePath).ProviderPath
 } else { $null }
 $wimImages = @(if ($resolvedImage) { Get-WimImages $resolvedImage })
+if ($Create -and -not $WhatIfPreference -and
+    -not $ImageIndexSpecified -and $wimImages.Count -gt 1) {
+    Write-Host ''
+    Write-Host 'Images available in the captured WIM:' -ForegroundColor Cyan
+    $wimImages | Format-Table Index, Name, Edition, Installation, Architecture `
+        -AutoSize | Out-Host
+    $indexAnswer = (Read-Host `
+        'Lock recovery to one index, or press Enter to offer all during recovery').Trim()
+    if ($indexAnswer) {
+        $parsedIndex = 0
+        if (-not [int]::TryParse($indexAnswer, [ref]$parsedIndex) -or
+            $parsedIndex -notin $wimImages.Index) {
+            throw "Image index must be one of: $($wimImages.Index -join ', ')."
+        }
+        $ImageIndex = $parsedIndex
+        $ImageIndexSpecified = $true
+    }
+}
 if ($resolvedImage -and $ImageIndexSpecified -and
     $ImageIndex -notin $wimImages.Index) {
     throw "WIM index $ImageIndex does not exist. Available indexes: $($wimImages.Index -join ', ')."
@@ -729,11 +794,10 @@ if ($WhatIfPreference) {
     return
 }
 if ($bitlockerOn) { throw 'Suspend BitLocker before continuing.' }
-
 New-Item -ItemType Directory -Path $WorkingRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $MountPath -Force | Out-Null
 
-if ($Prepare) {
+if ($Prepare -or $Create) {
     if ($factoryPart) { throw 'Factory recovery already exists; use --update or --integrate.' }
     if ($image.Length + 2GB -gt $RecoveryBytes) {
         throw 'Image plus the 2 GB margin does not fit.'
@@ -744,8 +808,10 @@ if ($Prepare) {
         ($RecoveryBytes + $PartitionAlignmentReserve + 1GB)) {
         throw 'Insufficient safe shrink space.'
     }
-    if ((Read-Host 'Type PREPARE to create/populate recovery') -cne 'PREPARE') {
-        Write-Host 'Cancelled; no changes made.'; return
+    if (-not $Create -and
+        (Read-Host 'Type PREPARE to create/populate recovery') -cne 'PREPARE') {
+        Write-Host 'Cancelled; no changes made.'
+        return
     }
     if (-not $PSCmdlet.ShouldProcess("disk $($osDisk.Number)", 'prepare recovery partition')) {
         return
@@ -788,14 +854,21 @@ exit
 "@ | Set-Content $attributeFile -Encoding ASCII
         Invoke-Native diskpart.exe @('/s', $attributeFile)
         Write-Host 'Prepared successfully. BCD and WinRE were not changed.' -ForegroundColor Green
-        Write-Host 'Reboot and confirm normal Windows startup before --integrate.'
+        if ($Prepare) {
+            Write-Host 'Reboot and confirm normal Windows startup before --integrate.'
+        } else {
+            Write-Host 'Preparation verified; continuing to integration.'
+        }
     } catch {
         if ($newPart) {
             Write-Warning "Partition $($newPart.PartitionNumber) remains for inspection but is not boot-integrated."
         }
         throw
     }
-    return
+    if ($Prepare) { return }
+    $factoryPart = Get-Partition -DiskNumber $osDisk.Number `
+        -PartitionNumber $newPart.PartitionNumber
+    $factoryVolume = Get-Volume -Partition $factoryPart
 }
 
 if (-not $factoryPart) { throw "No $RecoveryLabel partition exists." }
@@ -1027,7 +1100,8 @@ try {
     }
     $addBootEntry = Read-YesNo `
         'Add Factory Recovery to Windows Boot Manager?'
-    if ((Read-Host 'Type INTEGRATE to register WinRE and the Factory Recovery tile') -cne 'INTEGRATE') {
+    if (-not $Create -and
+        (Read-Host 'Type INTEGRATE to register WinRE and the Factory Recovery tile') -cne 'INTEGRATE') {
         Write-Host 'Cancelled; no changes made.'; return
     }
     if (-not $PSCmdlet.ShouldProcess('Windows boot configuration',

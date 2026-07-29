@@ -24,10 +24,10 @@ $managerUrl =
 function Read-MenuChoice {
     while ($true) {
         $answer = (Read-Host 'Choose an operation').Trim().ToLowerInvariant()
-        if ($answer -in @('1', '2', '3', '4', '5', 'h', 'q')) {
+        if ($answer -in @('1', '2', '3', '4', '5', '6', 'h', 'q')) {
             return $answer
         }
-        Write-Host 'Enter 1, 2, 3, 4, 5, h, or q.' -ForegroundColor Yellow
+        Write-Host 'Enter 1, 2, 3, 4, 5, 6, h, or q.' -ForegroundColor Yellow
     }
 }
 
@@ -77,11 +77,12 @@ function Add-ImageOptions {
 
 Write-Host ''
 Write-Host 'Windows Factory Recovery Manager' -ForegroundColor Cyan
-Write-Host '  1  Show a read-only plan'
-Write-Host '  2  Prepare the recovery partition and files'
-Write-Host '  3  Integrate a prepared package with BCD and WinRE'
-Write-Host '  4  Update an existing factory image'
-Write-Host '  5  Remove Factory Recovery completely'
+Write-Host '  1  Create Factory Recovery (plan, prepare, and integrate)'
+Write-Host '  2  Show a read-only plan'
+Write-Host '  3  Prepare the recovery partition and files only'
+Write-Host '  4  Integrate a prepared package with BCD and WinRE'
+Write-Host '  5  Update an existing factory image'
+Write-Host '  6  Remove Factory Recovery completely'
 Write-Host '  h  Show manager help'
 Write-Host '  q  Quit'
 Write-Host ''
@@ -94,17 +95,20 @@ if ($choice -eq 'q') {
 
 $managerArguments = [Collections.Generic.List[string]]::new()
 switch ($choice) {
-    '1' { Add-ImageOptions $managerArguments -IncludeSize }
-    '2' {
+    '1' {
+        $managerArguments.Add('--create')
+    }
+    '2' { Add-ImageOptions $managerArguments -IncludeSize }
+    '3' {
         Add-ImageOptions $managerArguments -IncludeSize
         $managerArguments.Add('--prepare')
     }
-    '3' { $managerArguments.Add('--integrate') }
-    '4' {
+    '4' { $managerArguments.Add('--integrate') }
+    '5' {
         Add-ImageOptions $managerArguments
         $managerArguments.Add('--update')
     }
-    '5' { $managerArguments.Add('--remove') }
+    '6' { $managerArguments.Add('--remove') }
     'h' { $managerArguments.Add('--help') }
 }
 

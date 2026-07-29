@@ -12,11 +12,13 @@ Open Windows PowerShell and run:
 irm https://raw.githubusercontent.com/yuanliuus/createWindowsFactoryRecovery/main/Invoke-WindowsFactoryRecovery.ps1 | iex
 ```
 
-The launcher presents a menu for a read-only plan, preparation, integration,
-image update, complete removal, or help. It downloads the current manager to a
-temporary file, displays its SHA-256 hash, requests UAC elevation when needed,
-and removes the temporary copy afterward. All confirmations and safety checks
-in the full manager remain active.
+The launcher presents a menu for guided creation, a read-only plan,
+prepare-only, integration-only, image update, complete removal, or help. Guided
+creation runs the plan, asks whether to continue, prepares the recovery
+partition and files, and then integrates the verified package. The launcher
+downloads the current manager to a temporary file, displays its SHA-256 hash,
+requests UAC elevation when needed, and removes the temporary copy afterward.
+All confirmations and safety checks in the full manager remain active.
 
 `irm ... | iex` executes code obtained from the network. Review the
 [bootstrap source](https://github.com/yuanliuus/createWindowsFactoryRecovery/blob/main/Invoke-WindowsFactoryRecovery.ps1)
@@ -51,6 +53,7 @@ executable; renamed system tools cannot reliably resolve their MUI messages.
 | `--image-path` | `-i` | Captured WIM |
 | `--image-index` | `-n` | Lock recovery to one index; default allows all |
 | `--recovery-size-gb` | `-s` | New partition size; default 20 |
+| `--create` | `-c` | Guided plan, prepare, and integrate workflow |
 | `--prepare` | `-p` | Create/populate only |
 | `--integrate` | `-g` | BCD and WinRE integration only |
 | `--update` | `-u` | Update existing recovery files only |
@@ -95,6 +98,35 @@ To restrict recovery to one image, specify it explicitly:
 Recovery never parses localized DISM output to validate the selection. The
 build-generated catalog and validator whitelist only indexes that existed in
 the copied WIM.
+
+### Guided creation
+
+```powershell
+.\Manage-WindowsFactoryRecovery.ps1 --create
+```
+
+`--create` first displays the four-stage workflow and asks `y/n`. Only after
+approval does it ask for the captured WIM path, recovery partition size, and,
+for a multi-image WIM, whether to lock one index or offer every image during
+recovery. It then prints the complete read-only machine/WIM plan before using
+the existing preparation safety checks and high-impact confirmation.
+
+After preparation, it verifies the copied WIM, rediscovers the new recovery
+partition, and continues through the existing checkpointed integration flow.
+It still asks whether to add the separate Boot Manager entry. If preparation
+fails, integration is never attempted. If integration fails, its BCD and WinRE
+rollback remains active while the prepared partition is retained for
+inspection.
+
+Parameters can also be supplied in advance for unattended parameter entry
+while retaining confirmations:
+
+```powershell
+.\Manage-WindowsFactoryRecovery.ps1 `
+  --image-path 'E:\Windows_Images\factory.wim' `
+  --recovery-size-gb 20 `
+  --create
+```
 
 ### 2. Prepare the partition and files
 
