@@ -41,7 +41,8 @@ $required = @(
     'Checkpoint-', '/export', '/import',
     'Old WinRE: preserve any existing recovery partition',
     'Type REMOVE-ORIGINAL-WINRE to continue',
-    'Original WinRE removal requires WinRE to be enabled',
+    'Registering and verifying it before deletion',
+    'ReAgent-before.txt',
     'PreviousWinre.sha256', 'Manifest-before.json',
     'extended into the released space.',
     'Get-VerifiedPartitionAtOffset',
@@ -52,6 +53,8 @@ $required = @(
     'Legacy package partition-number mismatch',
     'AllowLegacyPartitionNumberDrift:$Update',
     'Package immutable-layout mismatch',
+    'Invoke-NativeConsole',
+    'native console handle',
     'UpdateInProgress',
     'replace the recovery files in place',
     'Do not restart or power off',
@@ -98,10 +101,21 @@ if ($typedCreationPosition -lt 0 -or
     $typedCreationPosition -gt $newIdentityPosition) {
     throw 'Typed-creation identity ordering is invalid.'
 }
+if ($source -match
+        '(?s)Invoke-NativeConsole\s+dism\.exe.{0,250}\|\s*Out-Host') {
+    throw 'Interactive DISM output is still routed through the PowerShell pipeline.'
+}
 $removalRegistrationPosition = $source.IndexOf(
     '$registrationCheck = Get-WinreRegistration')
 $removalBackupPosition = $source.IndexOf(
     "Join-Path `$checkpoint 'PreviousWinre.wim'")
+$removalBcdBackupPosition = $source.IndexOf(
+    "`$bcdBackup = Join-Path `$checkpoint 'BCD'", $removalBackupPosition)
+$factoryRegistrationPosition = $source.IndexOf(
+    "'/setreimage', '/path', `$paths.RecoveryRoot", $removalBcdBackupPosition)
+$factoryRegistrationCheckPosition = $source.IndexOf(
+    '$factoryRegistration = Get-WinreRegistration',
+    $factoryRegistrationPosition)
 $verifiedRemovalPosition = $source.IndexOf(
     'Remove-Partition -InputObject $verifiedLegacy')
 $factoryExpansionPosition = $source.IndexOf(
@@ -110,15 +124,21 @@ $expandedManifestPosition = $source.IndexOf(
     'Write-Manifest $paths $expandedFactory')
 if ($removalRegistrationPosition -lt 0 -or
     $removalBackupPosition -lt 0 -or
+    $removalBcdBackupPosition -lt 0 -or
+    $factoryRegistrationPosition -lt 0 -or
+    $factoryRegistrationCheckPosition -lt 0 -or
     $verifiedRemovalPosition -lt 0 -or
     $factoryExpansionPosition -lt 0 -or
     $expandedManifestPosition -lt 0 -or
     $removalRegistrationPosition -gt $removalBackupPosition -or
-    $removalBackupPosition -gt $verifiedRemovalPosition -or
+    $removalBackupPosition -gt $removalBcdBackupPosition -or
+    $removalBcdBackupPosition -gt $factoryRegistrationPosition -or
+    $factoryRegistrationPosition -gt $factoryRegistrationCheckPosition -or
+    $factoryRegistrationCheckPosition -gt $verifiedRemovalPosition -or
     $verifiedRemovalPosition -gt $factoryExpansionPosition -or
     $factoryExpansionPosition -gt $expandedManifestPosition) {
-    throw ('Legacy WinRE registration, backup, deletion, expansion, and ' +
-        'manifest ordering is invalid.')
+    throw ('Legacy WinRE backup, Factory WinRE registration, verified ' +
+        'deletion, expansion, and manifest ordering is invalid.')
 }
 
 $source = $source -replace
@@ -130,6 +150,8 @@ $script:MockMultipleImages = $false
 $script:CancelCreate = $false
 $script:MockOriginalWinre = $false
 $script:MockFactoryRecovery = $false
+$script:MockWinreDisabled = $false
+$script:MockLocalizedWinre = $false
 
 function Stop-Mutation([string] $Name) {
     $script:Mutations++
@@ -163,8 +185,13 @@ function global:Read-Host {
 function global:reagentc.exe {
     if ($args -contains '/info') {
         $global:LASTEXITCODE = 0
-        if ($script:MockOriginalWinre -or $script:MockFactoryRecovery) {
-            'Windows RE status: Enabled'
+        if (-not $script:MockWinreDisabled -and
+            ($script:MockOriginalWinre -or $script:MockFactoryRecovery)) {
+            if ($script:MockLocalizedWinre) {
+                'Windows RE 状态: 已启用'
+            } else {
+                'Windows RE status: Enabled'
+            }
             'Windows RE location: \\?\GLOBALROOT\device\harddisk0\partition4\Recovery\WindowsRE'
         } else {
             'Windows RE status: Disabled'
@@ -309,13 +336,26 @@ try {
     $script:MockFactoryRecovery = $true
     $removeOriginalPlan = & $production '--remove-original-winre' `
         '--what-if' 6>&1 | Out-String
+    $script:MockLocalizedWinre = $true
+    $removeOriginalLocalizedPlan = & $production `
+        '--remove-original-winre' '--what-if' 6>&1 | Out-String
+    $script:MockLocalizedWinre = $false
+    $script:MockWinreDisabled = $true
+    $removeOriginalRegistrationPlan = & $production `
+        '--remove-original-winre' '--what-if' 6>&1 | Out-String
+    $script:MockWinreDisabled = $false
     $script:MockFactoryRecovery = $false
     if ($removeOriginalPlan -notmatch
             'Remove\s+:\s+legacy WinRE on disk 0, partition 5' -or
         $removeOriginalPlan -notmatch
             'Reclaim\s+:\s+extend Factory Recovery into the released space' -or
+        $removeOriginalLocalizedPlan -notmatch
+            'WinRE\s+:\s+verify Factory Recovery remains the enabled target' -or
+        $removeOriginalRegistrationPlan -notmatch
+            'WinRE\s+:\s+checkpoint and register the verified Factory Recovery image' -or
         $script:Mutations -ne 0) {
-        throw "Original-WinRE removal plan failed.`n$removeOriginalPlan"
+        throw ("Original-WinRE removal plan failed.`n$removeOriginalPlan`n" +
+            "$removeOriginalLocalizedPlan`n$removeOriginalRegistrationPlan")
     }
 
     foreach ($arguments in @(
