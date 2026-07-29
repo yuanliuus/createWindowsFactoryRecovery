@@ -32,14 +32,11 @@ version-pinned behavior is required.
   VHD/VHDX boot, and multi-disk boot layouts are refused.
 - Keep tested Windows installation/recovery USB media available.
 - Suspend BitLocker before a modifying operation.
-- Existing WinRE is preserved by default. `--create` may remove only the
-  enabled, registered, same-disk Microsoft GPT recovery partition during the
-  guarded right-aligned preparation path, when the old partition is directly
-  adjacent and the user approves both the `y/n` choice and typed destructive
-  confirmation.
+- Existing WinRE is always preserved. Live deletion/recreation of the original
+  WinRE partition is disabled after a boot-disk incident.
 - The script never automatically recreates or enlarges an existing factory
   partition. That operation is intentionally offline/manual.
-- Removal deletes only a `FACTORY_RECOVERY` partition whose version-2 manifest
+- Removal deletes only a `FACTORY_RECOVERY` partition whose supported manifest
   matches the current Windows disk and partition layout.
 - No operation reboots the computer.
 
@@ -58,7 +55,7 @@ executable; renamed system tools cannot reliably resolve their MUI messages.
 | `--image-index` | `-n` | Lock recovery to one index; default allows all |
 | `--recovery-size-gb` | `-s` | New partition size; default 20 |
 | `--create` | `-c` | Guided plan, prepare, and integrate workflow |
-| `--remove-original-winre` | `-o` | With `--create`, remove verified old WinRE |
+| `--remove-original-winre` | `-o` | Disabled; exits without changing disk state |
 | `--prepare` | `-p` | Create/populate only |
 | `--integrate` | `-g` | BCD and WinRE integration only |
 | `--update` | `-u` | Update existing recovery files only |
@@ -113,10 +110,9 @@ the copied WIM.
 `--create` first displays the four-stage workflow and asks `y/n`. Only after
 approval does it ask for the captured WIM path, recovery partition size, and,
 for a multi-image WIM, whether to lock one index or offer every image during
-recovery. If an enabled, registered, adjacent original WinRE partition is
-verified, it also asks whether that partition should be replaced by the
-right-aligned layout. It then prints the complete read-only machine/WIM plan before
-using the existing preparation safety checks and high-impact confirmation.
+recovery. It prints the complete read-only machine/WIM plan before using the
+preparation safety checks and high-impact confirmation. Any existing WinRE
+partition is reported and preserved.
 
 After preparation, it verifies the copied WIM, rediscovers the new recovery
 partition, and continues through the existing checkpointed integration flow.
@@ -125,19 +121,10 @@ fails, integration is never attempted. If integration fails, its BCD and WinRE
 rollback remains active while the prepared partition is retained for
 inspection.
 
-If original-WinRE removal is selected, the script requires typing
-`REMOVE-ORIGINAL-WINRE`, stages the old `Winre.wim` and SHA-256 in a layout
-checkpoint, shrinks Windows, disables WinRE, and deletes only the previously
-verified partition. It creates Factory Recovery at the right edge formerly
-occupied by the old partition, then extends Windows into the released space on
-the left. The new partition's right edge and the Windows/Factory boundary are
-verified before files are populated and integration begins.
-
-If right-aligned preparation fails, the script removes any incomplete new
-factory partition, restores Windows to its original size, recreates the original
-WinRE partition at its recorded offset and size, restores `Winre.wim`, and
-re-enables REAgentC. Any disk, GPT type, registration, or adjacency mismatch
-refuses the removal path.
+The old `--remove-original-winre` option is retained only to fail closed with an
+explanation. It performs no discovery or mutation. Removing or relocating an
+existing WinRE partition requires tested offline servicing and is outside this
+script.
 
 Parameters can also be supplied in advance for unattended parameter entry
 while retaining confirmations:
@@ -146,7 +133,6 @@ while retaining confirmations:
 .\Manage-WindowsFactoryRecovery.ps1 `
   --image-path 'E:\Windows_Images\factory.wim' `
   --recovery-size-gb 20 `
-  --remove-original-winre `
   --create
 ```
 
@@ -167,7 +153,14 @@ Type `PREPARE`, then approve PowerShell's high-impact confirmation. This step:
    1 MB for GPT partition alignment.
 4. Builds the WinRE tile and separate factory WinPE image.
 5. Copies and SHA-256 verifies the captured WIM.
-6. Writes a disk/layout manifest and hides the new partition.
+6. Writes a disk/layout manifest, rediscovers the partition by exact
+   offset/size, verifies that it was created with the recovery GPT type, and
+   removes its drive letter.
+
+New packages use schema 4 and record immutable offsets and sizes for Windows,
+EFI, and Factory Recovery. A schema-2/3 package whose partition numbers changed
+is refused by `--integrate`; run `--update` with the captured WIM to rebuild both
+recovery images for the current layout and migrate the manifest safely.
 
 The normal WinRE image receives an explicit `Winpeshl.ini` that initializes
 WinPE and launches `RecEnv.exe`. Without that shell entry, WinPE falls back to
@@ -273,14 +266,10 @@ a later step fails.
 
 ## Existing WinRE partition
 
-The original WinRE partition is preserved unless removal is explicitly selected
-as part of `--create`. Removal is unavailable as an independent operation and
-is refused unless the partition is the enabled REAgentC target, uses the
-Microsoft GPT recovery type, is on the Windows disk, is distinct from Windows
-and EFI, and is directly after Windows. The guarded create path backs it up,
-places Factory Recovery against the same right disk boundary, and grows Windows
-to the left edge of Factory Recovery. The separate `--prepare` and `--integrate`
-workflow always preserves the original partition.
+The original WinRE partition is always preserved. `--create` and `--prepare`
+place Factory Recovery in newly released space without deleting, moving, or
+retyping the original WinRE partition. The deprecated removal option fails
+before administrator discovery, WIM inspection, or any storage operation.
 
 ## Verification
 

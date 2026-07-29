@@ -48,7 +48,7 @@ if ($RemovedPartition -and $parts.PartitionNumber -contains $RemovedPartition) {
 $manifestPath = Join-Path `
     (Join-Path $factoryVolume.Path 'FactoryRecovery') 'Manifest.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-$actualImageIndexes = if ($manifest.SchemaVersion -eq 3) {
+$actualImageIndexes = if ($manifest.SchemaVersion -in @(3, 4)) {
     @($manifest.AllowedImageIndexes | ForEach-Object { [int] $_ })
 } else {
     @([int] $manifest.ImageIndex)
@@ -96,7 +96,7 @@ foreach ($expected in @(
     FactorySizeGB = [math]::Round($factoryPart.Size / 1GB, 2)
     ManifestStatus = $manifest.Status
     ImageIndexes = $actualIndexText
-    ImageSelection = if ($manifest.SchemaVersion -eq 3) {
+    ImageSelection = if ($manifest.SchemaVersion -in @(3, 4)) {
         $manifest.ImageSelection
     } else { 'Legacy locked' }
     WinRE = "Enabled on partition $ExpectedFactoryPartition"
