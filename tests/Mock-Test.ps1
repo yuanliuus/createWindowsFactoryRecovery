@@ -42,8 +42,10 @@ $required = @(
     'Old WinRE: no verified adjacent removal candidate',
     'Remove original WinRE partition',
     'Type REMOVE-ORIGINAL-WINRE',
-    "Remove-Partition -DiskNumber `$oldWinrePart.DiskNumber",
+    "Remove-Partition -DiskNumber `$originalWinrePart.DiskNumber",
     'PreviousWinre.sha256',
+    '$rightAlignedOffset',
+    'The right-aligned Windows/Factory Recovery layout failed verification.',
     'Online delete/recreate resizing is intentionally disabled',
     'Type REMOVE-FACTORY to permanently remove factory recovery',
     'New-CleanWinre',
@@ -71,7 +73,7 @@ if ($exportPosition -lt 0 -or $disablePosition -lt 0 -or
     throw 'BCD export must occur before WinRE is disabled.'
 }
 $previousWinreBackupPosition = $source.IndexOf(
-    "Join-Path `$checkpoint 'PreviousWinre.wim'")
+    "Join-Path `$layoutCheckpoint 'PreviousWinre.wim'")
 $integrationDisablePosition = if ($previousWinreBackupPosition -ge 0) {
     $source.IndexOf("reagentc.exe @('/disable')",
         $previousWinreBackupPosition)
@@ -81,14 +83,18 @@ if ($previousWinreBackupPosition -lt 0 -or
     $previousWinreBackupPosition -gt $integrationDisablePosition) {
     throw 'Original WinRE must be backed up before WinRE is disabled.'
 }
-$factoryRegistrationCheckPosition = $source.IndexOf(
-    '$registeredAfter = Get-WinreRegistration')
 $originalRemovalPosition = $source.IndexOf(
-    'Remove-Partition -DiskNumber $oldWinrePart.DiskNumber')
-if ($factoryRegistrationCheckPosition -lt 0 -or
-    $originalRemovalPosition -lt 0 -or
-    $factoryRegistrationCheckPosition -gt $originalRemovalPosition) {
-    throw 'Factory WinRE registration must be verified before original partition removal.'
+    'Remove-Partition -DiskNumber $originalWinrePart.DiskNumber')
+$rightAlignedCreatePosition = $source.IndexOf(
+    '-Offset $rightAlignedOffset -Size $RecoveryBytes')
+$windowsReclaimPosition = $source.IndexOf(
+    '$expandedOsSupported = Get-PartitionSupportedSize')
+if ($originalRemovalPosition -lt 0 -or
+    $rightAlignedCreatePosition -lt 0 -or
+    $windowsReclaimPosition -lt 0 -or
+    $originalRemovalPosition -gt $rightAlignedCreatePosition -or
+    $rightAlignedCreatePosition -gt $windowsReclaimPosition) {
+    throw 'Original WinRE removal, right-aligned creation, and Windows reclaim ordering is invalid.'
 }
 
 $source = $source -replace
@@ -250,10 +256,25 @@ try {
         '--remove-original-winre' '--what-if' 6>&1 | Out-String
     $script:MockOriginalWinre = $false
     if ($removeOriginalPlan -notmatch
-        'Old WinRE:\s+remove disk 0, partition 4 only after successful integration' -or
+        'Old WinRE:\s+remove disk 0, partition 4 during preparation' -or
         $removeOriginalPlan -notmatch
-        'Reclaim\s+:\s+extend the new factory partition') {
+        'Layout\s+:\s+right-align Factory Recovery' -or
+        $removeOriginalPlan -notmatch
+        'Reclaim\s+:\s+extend Windows') {
         throw "Original WinRE removal plan test failed.`n$removeOriginalPlan"
+    }
+    $mockOsOffset = [uint64](1GB)
+    $mockOsSize = [uint64](100GB)
+    $mockOriginalWinreOffset = $mockOsOffset + $mockOsSize
+    $mockOriginalWinreSize = [uint64](1GB)
+    $mockFactorySize = [uint64](20GB)
+    $mockOldDiskEnd = $mockOriginalWinreOffset + $mockOriginalWinreSize
+    $mockFactoryOffset = $mockOldDiskEnd - $mockFactorySize
+    $mockFinalOsSize = $mockFactoryOffset - $mockOsOffset
+    if (($mockFactoryOffset + $mockFactorySize) -ne $mockOldDiskEnd -or
+        ($mockOsOffset + $mockFinalOsSize) -ne $mockFactoryOffset -or
+        $mockFactorySize -ne 20GB) {
+        throw 'Right-aligned layout arithmetic test failed.'
     }
 
     foreach ($arguments in @(
@@ -281,6 +302,7 @@ try {
         CreateCancellation = 'PASS'
         CreateWhatIf = 'PASS'
         OriginalWinreRemovalPlan = 'PASS'
+        RightAlignedLayoutMath = 'PASS'
         PrepareWhatIf = 'PASS'
         UpdateWhatIf = 'PASS'
         IntegrateWhatIf = 'PASS'

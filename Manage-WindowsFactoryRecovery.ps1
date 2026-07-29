@@ -779,7 +779,7 @@ if ($Create -and $registration.Enabled -and
         $removeOriginalWinreApproved = $RemoveOriginalWinre
         if (-not $WhatIfPreference -and -not $RemoveOriginalWinre) {
             $removeOriginalWinreApproved = Read-YesNo `
-                "Remove original WinRE partition $($candidate.PartitionNumber) after successful integration?"
+                "Remove original WinRE partition $($candidate.PartitionNumber) and reclaim its space for Windows?"
         }
     } elseif ($RemoveOriginalWinre) {
         throw ('The registered WinRE partition is not a verified, adjacent GPT ' +
@@ -824,8 +824,9 @@ if ($RemoveFactory -and $factoryPart) {
 }
 if ($removeOriginalWinreApproved) {
     Write-Host ("  Old WinRE: remove disk $($originalWinrePart.DiskNumber), " +
-        "partition $($originalWinrePart.PartitionNumber) only after successful integration")
-    Write-Host '  Reclaim : extend the new factory partition into the adjacent released space'
+        "partition $($originalWinrePart.PartitionNumber) during preparation")
+    Write-Host '  Layout  : right-align Factory Recovery at the old disk end'
+    Write-Host '  Reclaim : extend Windows into the released space left of Factory Recovery'
 } elseif ($originalWinrePart) {
     Write-Host "  Old WinRE: preserve partition $($originalWinrePart.PartitionNumber)"
 } else {
@@ -863,18 +864,82 @@ if ($Prepare -or $Create) {
         Write-Host 'Cancelled; no changes made.'
         return
     }
+    if ($Create -and $removeOriginalWinreApproved -and
+        (Read-Host `
+            'Type REMOVE-ORIGINAL-WINRE to approve right-aligned replacement') -cne
+        'REMOVE-ORIGINAL-WINRE') {
+        Write-Host 'Original WinRE removal cancelled; it will be preserved.'
+        $removeOriginalWinreApproved = $false
+    }
     if (-not $PSCmdlet.ShouldProcess("disk $($osDisk.Number)", 'prepare recovery partition')) {
         return
     }
     $base = Get-BaseWinre $registration
     $newPart = $null
+    $originalOsSize = $osPartition.Size
+    $originalWinreRemoved = $false
+    $winreDisabledForLayout = $false
+    $layoutCheckpoint = $null
+    if ($Create -and $removeOriginalWinreApproved) {
+        $layoutCheckpoint = Join-Path $WorkingRoot `
+            ('OriginalWinRE-Layout-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        New-Item -ItemType Directory -Path $layoutCheckpoint -Force | Out-Null
+        Copy-Item -LiteralPath $base `
+            -Destination (Join-Path $layoutCheckpoint 'PreviousWinre.wim') -Force
+        (Get-FileHash `
+            -LiteralPath (Join-Path $layoutCheckpoint 'PreviousWinre.wim') `
+            -Algorithm SHA256).Hash |
+            Set-Content (Join-Path $layoutCheckpoint 'PreviousWinre.sha256') `
+                -Encoding ASCII
+        $registration.Raw |
+            Set-Content (Join-Path $layoutCheckpoint 'ReAgent-before.txt')
+        Invoke-Native bcdedit.exe @('/export',
+            (Join-Path $layoutCheckpoint 'BCD'))
+    }
     try {
         Resize-Partition -DiskNumber $osDisk.Number `
             -PartitionNumber $osPartition.PartitionNumber `
             -Size ($osPartition.Size - $RecoveryBytes -
                 $PartitionAlignmentReserve)
-        $newPart = New-Partition -DiskNumber $osDisk.Number `
-            -Size $RecoveryBytes -DriveLetter $RecoveryLetter
+        if ($Create -and $removeOriginalWinreApproved) {
+            Invoke-Native reagentc.exe @('/disable')
+            $winreDisabledForLayout = $true
+            $rightAlignedOffset = (
+                $originalWinrePart.Offset + $originalWinrePart.Size
+            ) - $RecoveryBytes
+            $shrunkOs = Get-Partition -DiskNumber $osDisk.Number `
+                -PartitionNumber $osPartition.PartitionNumber
+            if ($rightAlignedOffset -le
+                ($shrunkOs.Offset + $shrunkOs.Size)) {
+                throw 'Right-aligned Factory Recovery would overlap Windows.'
+            }
+            Remove-Partition -DiskNumber $originalWinrePart.DiskNumber `
+                -PartitionNumber $originalWinrePart.PartitionNumber `
+                -Confirm:$false
+            $originalWinreRemoved = $true
+            $newPart = New-Partition -DiskNumber $osDisk.Number `
+                -Offset $rightAlignedOffset -Size $RecoveryBytes `
+                -DriveLetter $RecoveryLetter
+            $shrunkOs = Get-Partition -DiskNumber $osDisk.Number `
+                -PartitionNumber $osPartition.PartitionNumber
+            $expandedOsSupported = Get-PartitionSupportedSize `
+                -DiskNumber $shrunkOs.DiskNumber `
+                -PartitionNumber $shrunkOs.PartitionNumber
+            Resize-Partition -DiskNumber $shrunkOs.DiskNumber `
+                -PartitionNumber $shrunkOs.PartitionNumber `
+                -Size $expandedOsSupported.SizeMax
+            $expandedOs = Get-Partition -DiskNumber $osDisk.Number `
+                -PartitionNumber $osPartition.PartitionNumber
+            if (($newPart.Offset + $newPart.Size) -ne
+                    ($originalWinrePart.Offset + $originalWinrePart.Size) -or
+                ($expandedOs.Offset + $expandedOs.Size) -ne $newPart.Offset) {
+                throw 'The right-aligned Windows/Factory Recovery layout failed verification.'
+            }
+            $registration = Get-WinreRegistration
+        } else {
+            $newPart = New-Partition -DiskNumber $osDisk.Number `
+                -Size $RecoveryBytes -DriveLetter $RecoveryLetter
+        }
         $newPart | Format-Volume -FileSystem NTFS `
             -NewFileSystemLabel $RecoveryLabel -Confirm:$false | Out-Null
         $custom = New-CustomWinre $base $osDisk.Number `
@@ -903,17 +968,92 @@ remove letter=$RecoveryLetter
 exit
 "@ | Set-Content $attributeFile -Encoding ASCII
         Invoke-Native diskpart.exe @('/s', $attributeFile)
-        Write-Host 'Prepared successfully. BCD and WinRE were not changed.' -ForegroundColor Green
+        if ($Create -and $removeOriginalWinreApproved) {
+            Write-Host ('Prepared successfully. Factory Recovery is right-aligned, ' +
+                'Windows reclaimed the old WinRE space, and WinRE will now be integrated.') `
+                -ForegroundColor Green
+        } else {
+            Write-Host 'Prepared successfully. BCD and WinRE were not changed.' `
+                -ForegroundColor Green
+        }
         if ($Prepare) {
             Write-Host 'Reboot and confirm normal Windows startup before --integrate.'
         } else {
             Write-Host 'Preparation verified; continuing to integration.'
         }
     } catch {
-        if ($newPart) {
+        $prepareError = $_
+        if ($Create -and $removeOriginalWinreApproved) {
+            Write-Warning 'Right-aligned preparation failed; restoring the original disk layout.'
+            try {
+                if (-not (Get-Partition `
+                        -DiskNumber $originalWinrePart.DiskNumber `
+                        -PartitionNumber $originalWinrePart.PartitionNumber `
+                        -ErrorAction SilentlyContinue)) {
+                    $originalWinreRemoved = $true
+                }
+                if ($newPart -and (Get-Partition `
+                        -DiskNumber $newPart.DiskNumber `
+                        -PartitionNumber $newPart.PartitionNumber `
+                        -ErrorAction SilentlyContinue)) {
+                    Remove-Partition -DiskNumber $newPart.DiskNumber `
+                        -PartitionNumber $newPart.PartitionNumber `
+                        -Confirm:$false
+                }
+                $currentOs = Get-Partition -DiskNumber $osDisk.Number `
+                    -PartitionNumber $osPartition.PartitionNumber
+                if ($currentOs.Size -ne $originalOsSize) {
+                    Resize-Partition -DiskNumber $currentOs.DiskNumber `
+                        -PartitionNumber $currentOs.PartitionNumber `
+                        -Size $originalOsSize
+                }
+                if ($originalWinreRemoved) {
+                    $restoredWinre = New-Partition `
+                        -DiskNumber $originalWinrePart.DiskNumber `
+                        -Offset $originalWinrePart.Offset `
+                        -Size $originalWinrePart.Size `
+                        -DriveLetter $RecoveryLetter
+                    $restoredWinre | Format-Volume -FileSystem NTFS `
+                        -NewFileSystemLabel 'Windows RE tools' `
+                        -Confirm:$false | Out-Null
+                    $restoredRoot = "$RecoveryLetter`:\Recovery\WindowsRE"
+                    New-Item -ItemType Directory -Path $restoredRoot `
+                        -Force | Out-Null
+                    Copy-Item -LiteralPath (Join-Path `
+                            $layoutCheckpoint 'PreviousWinre.wim') `
+                        -Destination (Join-Path $restoredRoot 'Winre.wim') `
+                        -Force
+                    Set-Partition -DiskNumber $restoredWinre.DiskNumber `
+                        -PartitionNumber $restoredWinre.PartitionNumber `
+                        -GptType '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
+                    Invoke-Native reagentc.exe @(
+                        '/setreimage', '/path', $restoredRoot)
+                    Invoke-Native reagentc.exe @('/enable')
+                    $restoreAttributes = Join-Path $WorkingRoot `
+                        'RestoreOriginalWinREAttributes.txt'
+@"
+select disk $($restoredWinre.DiskNumber)
+select partition $($restoredWinre.PartitionNumber)
+gpt attributes=0x8000000000000001
+remove letter=$RecoveryLetter
+exit
+"@ | Set-Content $restoreAttributes -Encoding ASCII
+                    Invoke-Native diskpart.exe @('/s', $restoreAttributes)
+                } elseif ($winreDisabledForLayout) {
+                    Invoke-Native reagentc.exe @('/enable')
+                }
+                Write-Warning 'The original Windows and WinRE partition layout was restored.'
+            } catch {
+                throw ("Preparation failed and automatic original-layout " +
+                    "restoration also failed. Keep the machine running. " +
+                    "Checkpoint: $layoutCheckpoint`nPreparation: " +
+                    "$($prepareError.Exception.Message)`nRestoration: " +
+                    "$($_.Exception.Message)")
+            }
+        } elseif ($newPart) {
             Write-Warning "Partition $($newPart.PartitionNumber) remains for inspection but is not boot-integrated."
         }
-        throw
+        throw $prepareError
     }
     if ($Prepare) { return }
     $factoryPart = Get-Partition -DiskNumber $osDisk.Number `
@@ -1182,14 +1322,6 @@ try {
         if (-not (Test-Path (Join-Path $oldWinrePath 'Winre.wim'))) {
             throw 'The previous WinRE image cannot be staged for rollback.'
         }
-        if ($Create -and $removeOriginalWinreApproved) {
-            $previousWinreBackup = Join-Path $checkpoint 'PreviousWinre.wim'
-            Copy-Item -LiteralPath (Join-Path $oldWinrePath 'Winre.wim') `
-                -Destination $previousWinreBackup -Force
-            (Get-FileHash -LiteralPath $previousWinreBackup -Algorithm SHA256).Hash |
-                Set-Content (Join-Path $checkpoint 'PreviousWinre.sha256') `
-                    -Encoding ASCII
-        }
     }
     try {
         if ($registration.Enabled) {
@@ -1238,72 +1370,15 @@ try {
         if ($oldWinrePath) {
             & reagentc.exe /setreimage /path $oldWinrePath | Out-Null
             if ($registration.Enabled) { & reagentc.exe /enable | Out-Null }
+        } elseif ($Create -and $removeOriginalWinreApproved) {
+            & reagentc.exe /setreimage /path $paths.RecoveryRoot | Out-Null
+            & reagentc.exe /enable | Out-Null
         }
         & bcdedit.exe /import $bcdBackup | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Warning 'Automatic BCD rollback failed. Keep the checkpoint and do not reboot.'
         }
         throw
-    }
-    if ($Create -and $removeOriginalWinreApproved) {
-        if (-not $oldWinrePart -or
-            $oldWinrePart.DiskNumber -ne $originalWinrePart.DiskNumber -or
-            $oldWinrePart.PartitionNumber -ne
-                $originalWinrePart.PartitionNumber) {
-            throw 'The staged previous WinRE partition no longer matches the approved target.'
-        }
-        $registeredAfter = Get-WinreRegistration
-        if (-not $registeredAfter.Enabled -or
-            $registeredAfter.DiskNumber -ne $factoryPart.DiskNumber -or
-            $registeredAfter.PartitionNumber -ne $factoryPart.PartitionNumber) {
-            throw 'Original WinRE removal refused because WinRE is not verified on the factory partition.'
-        }
-        $currentFactoryPart = Get-Partition `
-            -DiskNumber $factoryPart.DiskNumber `
-            -PartitionNumber $factoryPart.PartitionNumber
-        if (($currentFactoryPart.Offset + $currentFactoryPart.Size) -ne
-            $oldWinrePart.Offset) {
-            throw 'Original WinRE removal refused because its space is not adjacent to Factory Recovery.'
-        }
-        Write-Warning ("This permanently deletes original WinRE partition " +
-            "$($oldWinrePart.PartitionNumber) after the new WinRE integration passed.")
-        if ((Read-Host `
-                'Type REMOVE-ORIGINAL-WINRE to delete and combine it with Factory Recovery') -cne
-            'REMOVE-ORIGINAL-WINRE') {
-            Write-Host 'Original WinRE partition was preserved.'
-        } elseif ($PSCmdlet.ShouldProcess(
-                "disk $($oldWinrePart.DiskNumber), partition $($oldWinrePart.PartitionNumber)",
-                'remove original WinRE and extend Factory Recovery')) {
-            if ($oldWinreAccessAdded) {
-                Remove-TemporaryAccessPath `
-                    -DiskNumber $oldWinrePart.DiskNumber `
-                    -PartitionNumber $oldWinrePart.PartitionNumber `
-                    -Letter $oldWinreLetter
-                $oldWinreAccessAdded = $false
-            }
-            $oldPartitionNumber = $oldWinrePart.PartitionNumber
-            Remove-Partition -DiskNumber $oldWinrePart.DiskNumber `
-                -PartitionNumber $oldPartitionNumber -Confirm:$false
-            if (Get-Partition -DiskNumber $oldWinrePart.DiskNumber `
-                    -PartitionNumber $oldPartitionNumber `
-                    -ErrorAction SilentlyContinue) {
-                throw 'The original WinRE partition still exists after removal.'
-            }
-            $currentFactoryPart = Get-Partition `
-                -DiskNumber $factoryPart.DiskNumber `
-                -PartitionNumber $factoryPart.PartitionNumber
-            $factorySupported = Get-PartitionSupportedSize `
-                -DiskNumber $currentFactoryPart.DiskNumber `
-                -PartitionNumber $currentFactoryPart.PartitionNumber
-            Resize-Partition -DiskNumber $currentFactoryPart.DiskNumber `
-                -PartitionNumber $currentFactoryPart.PartitionNumber `
-                -Size $factorySupported.SizeMax
-            $factoryPart = Get-Partition `
-                -DiskNumber $currentFactoryPart.DiskNumber `
-                -PartitionNumber $currentFactoryPart.PartitionNumber
-            Write-Host ('Original WinRE was removed and its adjacent space was ' +
-                'combined with Factory Recovery.') -ForegroundColor Green
-        }
     }
 } finally {
     if ($oldWinreAccessAdded) {

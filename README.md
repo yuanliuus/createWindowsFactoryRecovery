@@ -33,9 +33,10 @@ version-pinned behavior is required.
 - Keep tested Windows installation/recovery USB media available.
 - Suspend BitLocker before a modifying operation.
 - Existing WinRE is preserved by default. `--create` may remove only the
-  enabled, registered, same-disk Microsoft GPT recovery partition after the new
-  WinRE integration succeeds, when the old partition is directly adjacent and
-  the user approves both the `y/n` choice and typed destructive confirmation.
+  enabled, registered, same-disk Microsoft GPT recovery partition during the
+  guarded right-aligned preparation path, when the old partition is directly
+  adjacent and the user approves both the `y/n` choice and typed destructive
+  confirmation.
 - The script never automatically recreates or enlarges an existing factory
   partition. That operation is intentionally offline/manual.
 - Removal deletes only a `FACTORY_RECOVERY` partition whose version-2 manifest
@@ -113,8 +114,8 @@ the copied WIM.
 approval does it ask for the captured WIM path, recovery partition size, and,
 for a multi-image WIM, whether to lock one index or offer every image during
 recovery. If an enabled, registered, adjacent original WinRE partition is
-verified, it also asks whether that partition should be removed after successful
-integration. It then prints the complete read-only machine/WIM plan before
+verified, it also asks whether that partition should be replaced by the
+right-aligned layout. It then prints the complete read-only machine/WIM plan before
 using the existing preparation safety checks and high-impact confirmation.
 
 After preparation, it verifies the copied WIM, rediscovers the new recovery
@@ -124,13 +125,19 @@ fails, integration is never attempted. If integration fails, its BCD and WinRE
 rollback remains active while the prepared partition is retained for
 inspection.
 
-If original-WinRE removal is selected, the script waits until the new WinRE is
-registered and enabled on Factory Recovery and the BCD/default Windows loader
-checks have passed. It then requires typing `REMOVE-ORIGINAL-WINRE`, copies the
-old `Winre.wim` plus its SHA-256 into the integration checkpoint, deletes only
-the previously verified partition, confirms it is gone, and extends Factory
-Recovery into the adjacent released space. Any disk, GPT type, registration, or
-adjacency mismatch refuses removal.
+If original-WinRE removal is selected, the script requires typing
+`REMOVE-ORIGINAL-WINRE`, stages the old `Winre.wim` and SHA-256 in a layout
+checkpoint, shrinks Windows, disables WinRE, and deletes only the previously
+verified partition. It creates Factory Recovery at the right edge formerly
+occupied by the old partition, then extends Windows into the released space on
+the left. The new partition's right edge and the Windows/Factory boundary are
+verified before files are populated and integration begins.
+
+If right-aligned preparation fails, the script removes any incomplete new
+factory partition, restores Windows to its original size, recreates the original
+WinRE partition at its recorded offset and size, restores `Winre.wim`, and
+re-enables REAgentC. Any disk, GPT type, registration, or adjacency mismatch
+refuses the removal path.
 
 Parameters can also be supplied in advance for unattended parameter entry
 while retaining confirmations:
@@ -270,9 +277,10 @@ The original WinRE partition is preserved unless removal is explicitly selected
 as part of `--create`. Removal is unavailable as an independent operation and
 is refused unless the partition is the enabled REAgentC target, uses the
 Microsoft GPT recovery type, is on the Windows disk, is distinct from Windows
-and EFI, and is positioned so its released space can be combined with the new
-Factory Recovery partition. The separate `--prepare` and `--integrate` workflow
-always preserves the original partition.
+and EFI, and is directly after Windows. The guarded create path backs it up,
+places Factory Recovery against the same right disk boundary, and grows Windows
+to the left edge of Factory Recovery. The separate `--prepare` and `--integrate`
+workflow always preserves the original partition.
 
 ## Verification
 
