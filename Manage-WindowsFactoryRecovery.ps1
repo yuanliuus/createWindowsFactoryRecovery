@@ -538,6 +538,33 @@ exit
         }
         $showDetails | Set-Content `
             (Join-Path $tools 'ShowImageDetails.cmd') -Encoding ASCII
+        @'
+@echo off
+wpeinit
+:menu
+cls
+echo FACTORY RECOVERY STARTUP
+echo ========================
+echo.
+echo   1  Start Factory Recovery
+echo   2  Open Command Prompt
+echo.
+set "START_CHOICE="
+set /p START_CHOICE=Select an option:
+if "%START_CHOICE%"=="1" goto recovery
+if "%START_CHOICE%"=="2" goto commandprompt
+echo Invalid selection.
+pause
+goto menu
+:commandprompt
+echo.
+echo Type EXIT to return to this menu.
+cmd.exe
+goto menu
+:recovery
+call X:\Sources\Recovery\Tools\RestoreFactory.cmd
+goto menu
+'@ | Set-Content (Join-Path $tools 'FactoryRecoveryMenu.cmd') -Encoding ASCII
         $selectionBlock = if ($Indexes.Count -gt 1) {
 @'
 type X:\Sources\Recovery\Tools\ImageCatalog.txt
@@ -555,7 +582,6 @@ if errorlevel 1 (
         }
         @"
 @echo off
-wpeinit
 diskpart /s X:\Sources\Recovery\Tools\IdentifyDisk.txt > X:\FactoryDisk.txt
 "X:\Sources\Recovery\Tools\findstr.exe" /i /c:"$DiskId" X:\FactoryDisk.txt >nul
 if errorlevel 1 goto wrongdisk
@@ -608,7 +634,7 @@ wpeutil reboot
         $mounted = $true
         @'
 [LaunchApps]
-"%SYSTEMROOT%\System32\cmd.exe","/d /c X:\Sources\Recovery\Tools\RestoreFactory.cmd"
+"%SYSTEMROOT%\System32\cmd.exe","/d /c X:\Sources\Recovery\Tools\FactoryRecoveryMenu.cmd"
 '@ | Set-Content (Join-Path $MountPath 'Windows\System32\winpeshl.ini') -Encoding ASCII
         Invoke-NativeConsole dism.exe @(
             '/Unmount-Image', "/MountDir:$MountPath", '/Commit')
@@ -635,6 +661,7 @@ function New-CleanWinre {
         foreach ($name in @(
                 'WinREConfig.xml',
                 'RestoreFactory.cmd',
+                'FactoryRecoveryMenu.cmd',
                 'RestoreDisk.txt',
                 'IdentifyDisk.txt',
                 'ImageCatalog.txt',

@@ -29,6 +29,8 @@ $required = @(
     'Continue to create the factory recovery ? [y/n]',
     'Collect the image and recovery-size parameters.',
     'Preparation verified; continuing to integration.',
+    'FactoryRecoveryMenu.cmd',
+    'Type EXIT to return to this menu.',
     'user selects during recovery',
     'ImageCatalog.txt', 'ValidateImageIndex.cmd',
     'ShowImageDetails.cmd', 'ImageDetails-',
@@ -104,6 +106,14 @@ if ($typedCreationPosition -lt 0 -or
 if ($source -match
         '(?s)Invoke-NativeConsole\s+dism\.exe.{0,250}\|\s*Out-Host') {
     throw 'Interactive DISM output is still routed through the PowerShell pipeline.'
+}
+if (($source | Select-String -Pattern 'FactoryRecoveryMenu\.cmd' -AllMatches).
+        Matches.Count -lt 3 -or
+    $source -notmatch
+        '(?s)\[LaunchApps\].{0,150}FactoryRecoveryMenu\.cmd' -or
+    $source -notmatch
+        '(?s):commandprompt.{0,150}cmd\.exe.{0,80}goto menu') {
+    throw 'Factory Recovery startup-menu creation, launch, or cleanup is incomplete.'
 }
 $removalRegistrationPosition = $source.IndexOf(
     '$registrationCheck = Get-WinreRegistration')
