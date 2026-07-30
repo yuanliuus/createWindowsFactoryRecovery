@@ -201,12 +201,17 @@ After integration, reboot and test normal Windows first. Do not perform a real
 factory restore on a production machine merely as a test.
 
 For a non-destructive Factory Recovery boot test, boot the **Factory Recovery**
-entry, select any listed image index when prompted, verify the displayed title
-and details, and then press Enter without typing `RESTORE`. A package locked to
-one image selects it automatically but still displays its details. The
-cancellation path reboots directly to the normal default Windows loader. If the
-disk identity does not match, recovery refuses to format and opens a diagnostic
-command prompt.
+entry and choose **Start Factory Recovery**. Select any listed image index when
+prompted, verify the displayed title and details, and then press Enter without
+typing `RESTORE`. A package locked to one image selects it automatically but
+still displays its details. The cancellation path reboots directly to the
+normal default Windows loader. If the disk identity does not match, recovery
+refuses to format and opens a diagnostic command prompt.
+
+The standalone Factory Recovery boot image also offers **Open Command Prompt**
+before starting the recovery script. Type `exit` in that prompt to return to the
+startup menu. This choice applies only to the separate Factory Recovery boot
+entry; the normal Windows RE tile continues to open recovery directly.
 
 ## Update the captured image
 
